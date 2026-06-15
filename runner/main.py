@@ -29,7 +29,7 @@ async def main():
     print("╠══════════════════════════════════════════╣")
     print(f"║  Runner ID : {runner_id:<28}║")
     print(f"║  SRE       : {sre_id:<28}║")
-    print(f"║  Manager   : {manager_url[:28]:<28}║")
+    print(f"║  Server    : {manager_url[:28]:<28}║")
     print("╚══════════════════════════════════════════╝")
     print()
     print("  Nhận job → mở terminal mới → Claude Code tự điều tra")

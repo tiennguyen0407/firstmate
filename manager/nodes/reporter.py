@@ -20,7 +20,7 @@ async def report_result(state: FirstMateState) -> dict:
             else "_Không có findings đặc biệt_"
         hypothesis_text = f"\n\n💡 *Hypothesis:* {hypothesis}" \
             if hypothesis else ""
-        report = f"📋 *FirstMate-Manager*\n\n{findings_text}{hypothesis_text}"
+        report = f"📋 *Firstmate*\n\n{findings_text}{hypothesis_text}"
 
     return {
         "final_report": report,

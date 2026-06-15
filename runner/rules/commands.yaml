@@ -51,6 +51,11 @@ allow:
   - "man"
   - "help"
 
+  # Teleport SSH (luôn dùng tsh thay vì ssh trực tiếp)
+  - "/usr/local/bin/tsh ssh"
+  - "/usr/local/bin/tsh ls"
+  - "/usr/local/bin/tsh status"
+
   # Network read
   - "curl -s"
   - "curl --silent"
@@ -133,6 +138,10 @@ require_approval:
 
 # ─── LUÔN BỊ BLOCK (không bao giờ chạy) ─────────────────────────────────
 always_deny:
+  # SSH trực tiếp — luôn phải đi qua Teleport (/usr/local/bin/tsh ssh)
+  - "ssh"
+  - "scp"
+  - "rsync"
   - "kubectl delete namespace"
   - "kubectl delete cluster"
   - "kubectl delete node"

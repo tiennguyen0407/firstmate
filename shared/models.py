@@ -38,6 +38,7 @@ class Command(BaseModel):
 class Job(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     type: JobType
+    task_kind: str = "k8s"  # k8s | gateway_log | ...
     service: str
     env: str
     description: str

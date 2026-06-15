@@ -32,7 +32,7 @@ def _prepare_session(job: Job) -> Path:
     (d / ".claude").mkdir(parents=True, exist_ok=True)
 
     _write_claude_md(d, job)
-    _write_settings_json(d)
+    _write_settings_json(d, job)
     _write_whitelist_txt(d)
     _write_session_config(d, job)
     _write_notify_script(d)
@@ -47,6 +47,7 @@ def _write_claude_md(d: Path, job: Job) -> None:
         f"**Job ID**: `{job.id}`",
         f"**Service**: {job.service}",
         f"**Environment**: {job.env}",
+        f"**Task kind**: `{job.task_kind}`",
         "",
         "## Yêu cầu",
         "",
@@ -64,18 +65,28 @@ def _write_claude_md(d: Path, job: Job) -> None:
             "",
             "## Ngữ cảnh từ lần điều tra trước",
             "",
-            "> Đây là follow-up task. Kết quả điều tra trước đã có đầy đủ namespace, "
-            "deployment name và trạng thái service. **Dùng trực tiếp thông tin này, "
-            "KHÔNG cần scan lại `--all-namespaces` hay tìm kiếm service.**",
+            "> Đây là follow-up task. Kết quả điều tra trước đã có đầy đủ thông tin.",
+            "> **Dùng trực tiếp thông tin này, KHÔNG cần scan lại từ đầu.**",
             "",
             job.prev_summary,
         ]
 
-    lines += [
-        "",
-        "---",
-        "",
-        "## Quy tắc điều tra Kubernetes",
+    lines += ["", "---", ""]
+
+    if job.task_kind == "gateway_log":
+        gateway_folder = os.getenv("GATEWAY_FOLDER", "")
+        gateway_login = os.getenv("GATEWAY_LOGIN", "")
+        lines += _claude_md_gateway_log(gateway_folder, gateway_login)
+    else:
+        lines += _claude_md_k8s()
+
+    lines += _claude_md_common()
+    (d / "CLAUDE.md").write_text("\n".join(lines))
+
+
+def _claude_md_k8s() -> list[str]:
+    return [
+        "## Hướng dẫn — Kubernetes",
         "",
         "### Namespace scoping — QUAN TRỌNG",
         "",
@@ -104,19 +115,7 @@ def _write_claude_md(d: Path, job: Job) -> None:
         "Sau khi có kết quả: nếu nhiều service match, liệt kê tất cả và chọn cái gần nhất",
         "với mô tả gốc. Ghi rõ trong summary service nào được chọn và tại sao.",
         "",
-        "## Hướng dẫn",
-        "",
-        "- Commands trong whitelist chạy tự động không cần confirm",
-        "- Commands write: **KHÔNG hỏi xác nhận trong conversation** — chạy lệnh ngay, "
-        "FirstMate tự gửi Telegram alert và Claude Code hiện dialog approve trong terminal",
-        "- Không tự sửa settings.json hay bất kỳ file config nào trong session này",
-        "",
-        "## Khi hoàn thành",
-        "",
-        "**Bắt buộc**: Trước khi thoát, viết tóm tắt kết quả vào file `summary.md`.",
-        "File này được gửi tự động về manager để SRE verify và thông báo cho requester.",
-        "",
-        "**Chọn format phù hợp theo loại task — chỉ giữ các field có dữ liệu thực, bỏ field không liên quan:**",
+        "### Format summary",
         "",
         "**Kiểm tra định kỳ / thông tin** (không có sự cố):",
         "```",
@@ -146,17 +145,128 @@ def _write_claude_md(d: Path, job: Job) -> None:
         "**Đề xuất**: <SRE cần làm gì tiếp>",
         "```",
     ]
-    (d / "CLAUDE.md").write_text("\n".join(lines))
 
 
-def _write_settings_json(d: Path) -> None:
+def _claude_md_gateway_log(gateway_folder: str, gateway_login: str) -> list[str]:
+    gf = gateway_folder or "/GATEWAY_FOLDER_NOT_SET"
+    gl = gateway_login or "LOGIN_NOT_SET"
+    return [
+        "## Hướng dẫn — Gateway log",
+        "",
+        f"**Gateway folder**: `{gf}`  **Login**: `{gl}`",
+        "",
+        "### Bước 1 — Xác định thông tin",
+        "",
+        "Từ yêu cầu, trích xuất:",
+        "- `domain` — tên miền cần check (vd: `dev.zalopay.vn`)",
+        "- `env` — môi trường: `dev` / `qc` / `prod` (thường lấy từ prefix của domain hoặc từ Job Environment)",
+        "- `ip` — IP của gateway server (thường có trong yêu cầu hoặc tìm từ gateway folder)",
+        "",
+        "Nếu thiếu `ip`: dùng lệnh sau để tìm (thay `<env>` và `<domain>`):",
+        "```bash",
+        f"find {gf}/<env> -name '<domain>.conf' 2>/dev/null",
+        f"# IP nằm ở segment thứ 2 của path: {gf}/<env>/<ip>/nginx/...",
+        "```",
+        "",
+        "### Bước 2 — Tìm đường dẫn log file",
+        "",
+        "```bash",
+        f"grep 'access_log' {gf}/<env>/<ip>/nginx/conf/vhost/<domain>.conf",
+        "# Output: access_log /zserver/nginx/logs/<domain>_access.log json_analytics;",
+        "```",
+        "",
+        "### Bước 3 — Lấy log qua tsh ssh",
+        "",
+        "```bash",
+        f"/usr/local/bin/tsh ssh --login={gl} ipv4=<ip> \"bash -c 'tail -n 200 <log_path>'\"",
+        "# Ví dụ:",
+        f"/usr/local/bin/tsh ssh --login={gl} ipv4=10.40.81.2 \"bash -c 'tail -n 200 /zserver/nginx/logs/dev.zalopay.vn_access.log'\"",
+        "```",
+        "",
+        "### Bước 4 — Xử lý kết quả",
+        "",
+        "**Mode raw** (mặc định) — in ra 200 dòng log gần nhất, không phân tích thêm.",
+        "",
+        "**Mode analytics** (khi yêu cầu có `/analytics-log`) — phân tích và báo cáo:",
+        "- Top IP gọi nhiều nhất (số request, tần suất/phút)",
+        "- Tỷ lệ lỗi theo status code (4xx, 5xx)",
+        "- Pattern bất thường: burst request, IP gọi hàng trăm lần/phút → spam",
+        "- Recommend block tạm thời nếu có IP spam rõ ràng",
+        "- Endpoint bị gọi nhiều nhất",
+        "",
+        "### Format summary",
+        "",
+        "```",
+        "## Kết quả check log — <domain>",
+        "**Gateway**: <ip>  **Env**: <env>",
+        "**Log file**: <đường dẫn log trên server>",
+        "**Thời gian**: <timestamp đầu tiên> → <timestamp cuối cùng>",
+        "**Tổng request**: <N>",
+        "",
+        "### Top IPs (nếu analytics)",
+        "| IP | Requests | Req/phút | Đánh giá |",
+        "|---|---|---|---|",
+        "| x.x.x.x | 500 | 250 | ⚠️ Spam |",
+        "",
+        "### Status codes",
+        "| Code | Count | % |",
+        "",
+        "### Khuyến nghị",
+        "- Block tạm <ip> nếu spam: ...",
+        "```",
+    ]
+
+
+def _claude_md_common() -> list[str]:
+    return [
+        "",
+        "---",
+        "",
+        "## Bảo mật — TUYỆT ĐỐI tuân theo",
+        "",
+        "- **KHÔNG BAO GIỜ dùng `ssh` trực tiếp** — kể cả `ssh user@host`, `ssh -o ...`, hay bất kỳ biến thể nào.",
+        "- **Luôn SSH qua Teleport**: `/usr/local/bin/tsh ssh --login=$GATEWAY_LOGIN ipv4=<ip> \"bash -c '...'\"` ",
+        "- Không dùng `scp`, `rsync`, hay bất kỳ lệnh nào kết nối thẳng tới server bỏ qua Teleport.",
+        "",
+        "---",
+        "",
+        "## Hướng dẫn chung",
+        "",
+        "- Commands trong whitelist chạy tự động không cần confirm",
+        "- Commands write: **KHÔNG hỏi xác nhận trong conversation** — chạy lệnh ngay, "
+        "FirstMate tự gửi Telegram alert và Claude Code hiện dialog approve trong terminal",
+        "- Không tự sửa settings.json hay bất kỳ file config nào trong session này",
+        "",
+        "## Khi hoàn thành",
+        "",
+        "**Bắt buộc**: Trước khi thoát, viết tóm tắt kết quả vào file `summary.md`.",
+        "File này được gửi tự động về Firstmate để SRE verify và thông báo cho requester.",
+    ]
+
+
+def _write_settings_json(d: Path, job: Job) -> None:
+    extra_allow: list[str] = []
+    additional_dirs: list[str] = []
+
+    if job.task_kind == "gateway_log":
+        gf = os.getenv("GATEWAY_FOLDER", "").rstrip("/")
+        if gf:
+            # additionalDirectories: Claude Code coi gateway folder là working directory,
+            # cho phép read/find/cat không cần hỏi (docs: --add-dir equivalent in settings)
+            additional_dirs.append(gf)
+            # Belt-and-suspenders: explicit Read allow với absolute path format (//)
+            extra_allow += [
+                f"Read(//{gf.lstrip('/')}/**)",
+            ]
+
     settings = {
         "permissions": {
             # Write(summary.md) cần allow để Claude ghi kết quả mà không hỏi
             # Bash write ops (kubectl scale/apply/...) KHÔNG allow — hook gửi Telegram
             # rồi exit 0, Claude Code hiện permission dialog trong terminal cho SRE approve
-            "allow": allow_patterns_for_settings() + ["Write(*)"],
+            "allow": allow_patterns_for_settings() + ["Write(*)"] + extra_allow,
             "deny": deny_patterns_for_settings(),
+            "additionalDirectories": additional_dirs,
         },
         "hooks": {
             "PreToolUse": [
@@ -249,6 +359,8 @@ def _write_startup_script(d: Path, job: Job) -> Path:
     sre_tg_id = os.getenv("SRE_TELEGRAM_ID", "")
     manager_url = os.getenv("MANAGER_URL", "")
     runner_id = os.getenv("RUNNER_ID", "")
+    gateway_folder = os.getenv("GATEWAY_FOLDER", "")
+    gateway_login = os.getenv("GATEWAY_LOGIN", "")
 
     # Tìm đường dẫn tuyệt đối đến claude
     claude_bin = shutil.which("claude") or "claude"
@@ -284,6 +396,8 @@ export TELEGRAM_BOT_TOKEN="{bot_token}"
 export SRE_TELEGRAM_ID="{sre_tg_id}"
 export MANAGER_URL="{manager_url}"
 export RUNNER_ID="{runner_id}"
+export GATEWAY_FOLDER="{gateway_folder}"
+export GATEWAY_LOGIN="{gateway_login}"
 
 cd "{d}"
 
@@ -340,7 +454,7 @@ fi
         if [ -f "summary.md" ] && [ "$_SENT" = "0" ]; then
             _SENT=1
             echo ""
-            echo "📄 [watcher] summary.md đã tạo — đang báo manager..."
+            echo "📄 [watcher] summary.md đã tạo — đang báo Firstmate..."
             python3 "{d}/_notify.py"
         fi
         sleep 3
@@ -357,7 +471,7 @@ kill $_WATCHER_PID 2>/dev/null
 # Fallback: nếu watcher chưa gửi kịp, gửi lần cuối
 if [ -f "summary.md" ]; then
     echo ""
-    echo "📤 [fallback] Đang gửi kết quả về manager..."
+    echo "📤 [fallback] Đang gửi kết quả về Firstmate..."
     python3 "{d}/_notify.py"
 fi
 
