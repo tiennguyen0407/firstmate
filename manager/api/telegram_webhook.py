@@ -1165,11 +1165,19 @@ async def _debug_forward_to_sre(
         cfg = load_config()
         runners = cfg.get("runners", {})
 
+        from manager.services.config_loader import get_sres_for_service
         sre_info: dict | None = None
-        for rid, info in runners.items():
-            if not info.get("is_lead") and info.get("telegram_id"):
-                sre_info = {"id": rid, **info}
+        # 1) Service-aware: owner first, then SREs with services_owned
+        for candidate in get_sres_for_service(service):
+            if candidate.get("telegram_id"):
+                sre_info = candidate
                 break
+        # 2) Fallback: any non-lead runner
+        if not sre_info:
+            for rid, info in runners.items():
+                if not info.get("is_lead") and info.get("telegram_id"):
+                    sre_info = {"id": rid, **info}
+                    break
 
         if not sre_info:
             await get_bot().send_message(chat_id, "❌ Không tìm thấy SRE trong config.")
