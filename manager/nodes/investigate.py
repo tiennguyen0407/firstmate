@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from langchain_anthropic import ChatAnthropic
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from manager.state import FirstMateState
@@ -39,10 +39,11 @@ def _get_llm():
     global _llm
     if _llm is None:
         import os
-        _llm = ChatAnthropic(
-            model="claude-sonnet-4-6",
+        _llm = ChatOpenAI(
+            model="qwen/qwen3-5-27b",
+            base_url="https://maas-llm-aiplatform-hcm.api.vngcloud.vn/v1",
+            api_key=os.environ["GREENNODE_API_KEY"],
             temperature=0,
-            api_key=os.environ["ANTHROPIC_API_KEY"],
         ).bind_tools(K8S_READ_TOOLS)
     return _llm
 

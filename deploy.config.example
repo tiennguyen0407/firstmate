@@ -1,0 +1,7 @@
+REGISTRY="vcr.vngcloud.vn"
+REPO="your-repo-id"                                        # VD: 111480-abp112047
+IMAGE_NAME="your-image-name"                               # VD: firstmate-manager
+RUNTIME_ID="runtime-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" # từ GreenNode console
+FLAVOR="runtime-s2-general-2x4"                           # bash runtime.sh flavors để xem
+ENV_FILE=".env"
+SCRIPTS_DIR=".claude/skills/agentbase/scripts"

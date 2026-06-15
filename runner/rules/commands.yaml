@@ -1,0 +1,151 @@
+# FirstMate Runner — Whitelist rules
+# Chỉnh sửa file này để kiểm soát quyền Claude Code
+# Không cần restart runner — terminal session mới sẽ dùng rules mới
+
+# ─── AUTO-APPROVED (Claude không hỏi, chạy thẳng) ─────────────────────────
+allow:
+  # Kubernetes read-only
+  - "kubectl get"
+  - "kubectl describe"
+  - "kubectl logs"
+  - "kubectl top"
+  - "kubectl explain"
+  - "kubectl cluster-info"
+  - "kubectl api-resources"
+  - "kubectl api-versions"
+  - "kubectl version"
+  - "kubectl config get-contexts"
+  - "kubectl config current-context"
+  - "kubectl diff"
+
+  # Filesystem read
+  - "cat"
+  - "ls"
+  - "find"
+  - "grep"
+  - "head"
+  - "tail"
+  - "wc"
+  - "stat"
+  - "file"
+  - "du"
+  - "df"
+  - "tree"
+  - "less"
+  - "more"
+
+  # Shell utils (read-only)
+  - "echo"
+  - "pwd"
+  - "whoami"
+  - "id"
+  - "env"
+  - "printenv"
+  - "ps"
+  - "uptime"
+  - "uname"
+  - "hostname"
+  - "date"
+  - "which"
+  - "type"
+  - "man"
+  - "help"
+
+  # Network read
+  - "curl -s"
+  - "curl --silent"
+  - "wget -q"
+  - "dig"
+  - "nslookup"
+  - "host"
+  - "ping"
+  - "traceroute"
+  - "netstat"
+  - "ss"
+  - "lsof"
+
+  # Python/pip read
+  - "python3 -c"
+  - "python3 -m json"
+  - "pip list"
+  - "pip show"
+  - "pip freeze"
+
+  # Helm read
+  - "helm list"
+  - "helm get"
+  - "helm status"
+  - "helm history"
+
+  # Git read
+  - "git log"
+  - "git status"
+  - "git diff"
+  - "git show"
+  - "git branch"
+  - "git tag"
+
+# ─── CẦN APPROVAL Ở TERMINAL + ALERT TELEGRAM ────────────────────────────
+# Claude sẽ hỏi trong terminal, đồng thời Runner gửi Telegram notification
+require_approval:
+  # Kubernetes writes
+  - "kubectl delete"
+  - "kubectl apply"
+  - "kubectl create"
+  - "kubectl patch"
+  - "kubectl scale"
+  - "kubectl rollout restart"
+  - "kubectl rollout undo"
+  - "kubectl rollout pause"
+  - "kubectl rollout resume"
+  - "kubectl exec"
+  - "kubectl cp"
+  - "kubectl port-forward"
+  - "kubectl label"
+  - "kubectl annotate"
+  - "kubectl taint"
+  - "kubectl cordon"
+  - "kubectl uncordon"
+  - "kubectl drain"
+
+  # Helm writes
+  - "helm install"
+  - "helm upgrade"
+  - "helm rollback"
+  - "helm uninstall"
+  - "helm delete"
+
+  # System writes
+  - "rm"
+  - "mv"
+  - "cp"
+  - "chmod"
+  - "chown"
+  - "mkdir"
+  - "touch"
+  - "write"
+  - "tee"
+  - "kill"
+  - "pkill"
+  - "killall"
+  - "systemctl"
+  - "service"
+
+# ─── LUÔN BỊ BLOCK (không bao giờ chạy) ─────────────────────────────────
+always_deny:
+  - "kubectl delete namespace"
+  - "kubectl delete cluster"
+  - "kubectl delete node"
+  - "kubectl delete pv"
+  - "kubectl delete storageclass"
+  - "rm -rf /"
+  - "rm -rf /*"
+  - "chmod 777 /"
+  - "sudo rm -rf"
+  - "dd if"
+  - "mkfs"
+  - "format"
+  - "shutdown"
+  - "reboot"
+  - "init 0"
+  - "init 6"

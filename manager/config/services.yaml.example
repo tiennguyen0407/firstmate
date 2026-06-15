@@ -1,0 +1,63 @@
+services:
+  payment:
+    owner_sre: sre-yourname
+    namespace: production
+    k8s_cluster: prod-cluster
+    tier: critical
+    redis:
+      host: redis-prod.internal
+      port: 6379
+      db: 2
+      key_prefix: "session:*"
+    database:
+      host: pg-prod.internal
+      port: 5432
+      name: payment_db
+      allowed_tables:
+        - orders
+        - payments
+        - refunds
+
+  user-service:
+    owner_sre: sre-yourname2
+    namespace: production
+    k8s_cluster: prod-cluster
+    tier: high
+    redis:
+      host: redis-prod.internal
+      port: 6379
+      db: 0
+      key_prefix: "user:*"
+    database:
+      host: pg-prod.internal
+      port: 5432
+      name: user_db
+      allowed_tables:
+        - users
+        - sessions
+
+runners:
+  sre-yourname:
+    sre_id: yourname@company.com
+    telegram_id: "000000000"        # Telegram chat ID — lấy từ /myid trong bot
+    services_owned:
+      - payment
+      - checkout
+    is_lead: false
+
+  sre-yourname2:
+    sre_id: yourname2@company.com
+    telegram_id: "000000001"
+    services_owned:
+      - user-service
+      - auth
+    is_lead: false
+
+  sre-lead:
+    sre_id: lead@company.com
+    telegram_id: "000000002"
+    services_owned: []
+    is_lead: true
+
+sre_timeout_seconds: 300    # 5 phút không reply → escalate
+lead_timeout_seconds: 600   # 10 phút không reply → escalate

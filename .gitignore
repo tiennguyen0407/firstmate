@@ -1,6 +1,19 @@
+# Secrets & credentials
 .env
+runner/.env
+.greennode.json
+.agentbase/
+deploy.config
+
+# Sensitive config (chứa Telegram IDs, internal hosts, IPs nội bộ)
+manager/config/services.yaml
+manager/config/knowledge_base.yaml
+
+# Python
 .venv/
 __pycache__/
 *.pyc
 *.pyo
+
+# OS
 .DS_Store

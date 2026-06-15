@@ -46,6 +46,7 @@ class Job(BaseModel):
     requester_name: str
     assigned_sre: Optional[str] = None
     status: JobStatus = JobStatus.PENDING
+    prev_summary: Optional[str] = None  # kết quả điều tra trước (follow-up tasks)
 
 
 class TaskResult(BaseModel):

@@ -1,0 +1,61 @@
+# FirstMate — Knowledge Base
+# Copy file này thành knowledge_base.yaml và điền thông tin hệ thống thực tế.
+# Sau khi chỉnh sửa, chạy: bash deploy.sh để áp dụng.
+
+servers:
+  - ip: 10.x.x.1
+    name: gw-server
+    role: Gateway server
+    notes: Điểm vào chính của cụm, SSL termination và routing
+
+  - ip: 10.x.x.2
+    name: master-node-1
+    role: Kubernetes master node
+    notes: Control plane chính
+
+namespaces:
+  - name: your-team-qc
+    env: qc
+    team: your-team
+    services:
+      - your-service-a
+      - your-service-b
+
+  - name: your-team-prod
+    env: production
+    team: your-team
+    services:
+      - your-service-a
+
+services:
+  - name: your-service-a
+    description: Mô tả service
+    team: your-team
+    default_replicas: 3
+
+network:
+  - cidr: 10.0.0.0/8
+    name: Internal VPN
+    notes: Toàn bộ server nội bộ
+
+teams:
+  - name: your-team
+    lead: lead@company.com
+    slack: "#team-channel"
+
+notes: |
+  Môi trường:
+    - qc  : Quality Control / Testing
+    - prod: Production (live traffic)
+    - dev : Development (internal)
+
+  Kubernetes cluster: your-cluster-name
+  Container registry: your-registry/your-repo
+
+  Quy trình scale:
+    1. kubectl get deploy -n <namespace>
+    2. kubectl scale deploy <name> --replicas=<n> -n <namespace>
+    3. kubectl rollout status deploy/<name> -n <namespace>
+
+  Quy trình rollback:
+    kubectl rollout undo deploy/<name> -n <namespace>
