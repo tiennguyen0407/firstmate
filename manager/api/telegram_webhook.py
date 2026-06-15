@@ -1056,18 +1056,12 @@ async def _maybe_clarify_action(chat_id: str, text: str, name: str, task_kind: s
         await _start_new_task(chat_id, text, name, task_kind=task_kind, service=service)
         return
 
+    enriched_service = result.get("service") or service
+
     if from_follow:
         # /follow → tin tưởng LLM, cho phép auto-proceed
-        if result.get("ready"):
-            await _start_new_task(chat_id, result["action"], name, task_kind=task_kind, service=service)
-        else:
-            _active_conv[chat_id] = {
-                "role": "pending_confirm",
-                "confirmed_text": result.get("inferred", text),
-                "original_text": text,
-                "task_kind": task_kind,
-            }
-            await get_bot().send_message(chat_id, result.get("question", "Bạn xác nhận action này không?"))
+        inferred_text = result.get("action") if result.get("ready") else result.get("inferred", text)
+        await _start_new_task(chat_id, inferred_text, name, task_kind=task_kind, service=enriched_service)
     else:
         # Tin nhắn thường (không dùng /follow) → luôn hỏi xác nhận, gợi ý /follow
         inferred = result.get("action") if result.get("ready") else result.get("inferred", text)
@@ -1077,6 +1071,7 @@ async def _maybe_clarify_action(chat_id: str, text: str, name: str, task_kind: s
             "confirmed_text": inferred,
             "original_text": text,
             "task_kind": task_kind,
+            "service": enriched_service,
         }
         await get_bot().send_message(
             chat_id,
@@ -1094,8 +1089,9 @@ async def _handle_pending_confirm(chat_id: str, text: str, name: str, conv: dict
         # Xác nhận → forward với action đầy đủ
         confirmed = conv["confirmed_text"]
         task_kind = conv.get("task_kind", "k8s")
+        conv_service = conv.get("service")
         del _active_conv[chat_id]
-        await _start_new_task(chat_id, confirmed, name, task_kind=task_kind)
+        await _start_new_task(chat_id, confirmed, name, task_kind=task_kind, service=conv_service)
 
     elif text_lower in _NO_WORDS or any(w in text_lower for w in _NO_WORDS):
         # Hủy
@@ -1129,22 +1125,28 @@ Bạn là AI phân tích yêu cầu DevOps.
 Kiểm tra yêu cầu action mới có đủ thông tin để thực hiện không (cần rõ service/deployment name).
 Dựa vào lịch sử trò chuyện, suy luận xem người dùng đang muốn action trên service nào.
 
-Trả về JSON (không có markdown):
-- Nếu đủ context: {"ready": true, "action": "mô tả đầy đủ"}
-- Nếu thiếu, nhưng có thể suy luận: {"ready": false, "inferred": "mô tả đầy đủ suy luận được", "question": "câu hỏi xác nhận ngắn"}
+LUÔN extract "service" từ context: tên service dạng kebab-case hoặc cụm từ gốc (vd: "loyalty-tier-core", "loyalty tier core"). Nếu không suy luận được → null.
+
+Trả về JSON (không có markdown), LUÔN có "service" field:
+- Nếu đủ context (action + service rõ): {"ready": true, "action": "mô tả đầy đủ", "service": "tên-service"}
+- Nếu thiếu nhưng suy luận được: {"ready": false, "inferred": "mô tả đầy đủ", "question": "câu hỏi xác nhận ngắn", "service": "tên-service"}
 
 Ví dụ:
 Lịch sử: ["check pod loyalty-reward-store", "10 pod đang running"]
 Yêu cầu: "scale lên 12 pod"
-→ {"ready": false, "inferred": "scale loyalty-reward-store lên 12 pod", "question": "Có phải bạn muốn scale loyalty-reward-store lên 12 pod không?"}
+→ {"ready": false, "inferred": "scale loyalty-reward-store lên 12 pod", "question": "Có phải bạn muốn scale loyalty-reward-store lên 12 pod không?", "service": "loyalty-reward-store"}
+
+Lịch sử: ["check số pod của loyalty tier core", "4/4 pod Running"]
+Yêu cầu: "scale lên 12 pod"
+→ {"ready": false, "inferred": "scale loyalty-tier-core lên 12 pod", "question": "Có phải bạn muốn scale loyalty-tier-core lên 12 pod không?", "service": "loyalty-tier-core"}
 
 Lịch sử: ["deploy payment-service"]
 Yêu cầu: "restart đi"
-→ {"ready": false, "inferred": "restart payment-service", "question": "Bạn muốn restart payment-service không?"}
+→ {"ready": false, "inferred": "restart payment-service", "question": "Bạn muốn restart payment-service không?", "service": "payment-service"}
 
 Lịch sử: ["check log user-service"]
 Yêu cầu: "scale loyalty-reward-store lên 5 pod"
-→ {"ready": true, "action": "scale loyalty-reward-store lên 5 pod"}"""
+→ {"ready": true, "action": "scale loyalty-reward-store lên 5 pod", "service": "loyalty-reward-store"}"""
 
     history_text = "\n".join(f"• {m}" for m in history[-10:])
     response = await llm.ainvoke([
