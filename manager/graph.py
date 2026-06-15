@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import MemorySaver
+import os
+from greennode_agent_bridge import AgentBaseMemoryEvents
 
 from manager.state import FirstMateState
 from manager.nodes.investigate import investigate
@@ -96,7 +97,9 @@ def build_graph() -> StateGraph:
     builder.add_edge("escalated",     END)
 
     return builder.compile(
-        checkpointer=MemorySaver(),
+        checkpointer=AgentBaseMemoryEvents(
+            memory_id=os.environ["AGENTBASE_MEMORY_ID"],
+        ),
         interrupt_before=["waiting_sre", "waiting_runner", "waiting_lead"],
     )
 
