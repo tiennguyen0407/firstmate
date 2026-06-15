@@ -612,23 +612,26 @@ async def _handle_callback(query: CallbackQuery):
                     f"Nhắn tin vào đây để cập nhật trạng thái (xong/cần lead/chuyển task)."
                 )
 
-            elif action == "busy":
+            elif action in ("busy", "declined"):
+                label = "đang bận" if action == "busy" else "từ chối task"
+                icon = "🔄" if action == "busy" else "❌"
+                await query.edit_message_text(f"{icon} Đã báo {label}.")
                 await get_bot().send_message(
                     requester,
-                    f"🔄 *{sre_name}* đang bận. Đang tìm SRE khác...",
+                    f"{icon} *{sre_name}* {label}. Đang tìm SRE khác...",
                     parse_mode="Markdown",
                 )
-                await query.edit_message_text("🔄 Đã báo bận.")
-                # TODO: try next SRE (MVP: notify requester to retry)
-
-            elif action == "declined":
-                await get_bot().send_message(
-                    requester,
-                    f"❌ *{sre_name}* từ chối task.",
-                    parse_mode="Markdown",
-                )
-                await query.edit_message_text("❌ Đã từ chối.")
-                _cleanup_conv(job_id)
+                # Try next SRE, excluding all already-tried ones
+                tried = job_meta.get("tried_sres", [job_meta.get("sre_id", "")])
+                asyncio.create_task(_debug_forward_to_sre(
+                    job_id=job_id,
+                    text=job_meta["text"],
+                    chat_id=requester,
+                    requester_name=job_meta["requester_name"],
+                    service=job_meta["service"],
+                    task_kind=job_meta.get("task_kind", "k8s"),
+                    exclude=tried,
+                ))
 
         # ── Claude done verify ────────────────────────────────────
         elif kind == "verify":
@@ -1171,32 +1174,39 @@ Yêu cầu: "scale loyalty-reward-store lên 5 pod"
 # ══════════════════════════════════════════════════════════════════
 
 async def _debug_forward_to_sre(
-    job_id: str, text: str, chat_id: str, requester_name: str, service: str, task_kind: str = "k8s"
+    job_id: str, text: str, chat_id: str, requester_name: str, service: str,
+    task_kind: str = "k8s", exclude: list[str] | None = None,
 ):
     try:
-        from manager.services.config_loader import load_config
+        from manager.services.config_loader import load_config, get_sres_for_service
         cfg = load_config()
         runners = cfg.get("runners", {})
+        exclude = exclude or []
 
-        from manager.services.config_loader import get_sres_for_service
         sre_info: dict | None = None
         # 1) Service-aware: owner first, then SREs with services_owned
-        for candidate in get_sres_for_service(service):
+        for candidate in get_sres_for_service(service, exclude=exclude):
             if candidate.get("telegram_id"):
                 sre_info = candidate
                 break
-        # 2) Fallback: any non-lead runner
+        # 2) Fallback: any non-lead runner not excluded
         if not sre_info:
             for rid, info in runners.items():
-                if not info.get("is_lead") and info.get("telegram_id"):
-                    sre_info = {"id": rid, **info}
-                    break
+                if rid in exclude or info.get("is_lead") or not info.get("telegram_id"):
+                    continue
+                sre_info = {"id": rid, **info}
+                break
 
         if not sre_info:
-            await get_bot().send_message(chat_id, "❌ Không tìm thấy SRE trong config.")
+            await get_bot().send_message(
+                chat_id,
+                "❌ Không có SRE nào available. Vui lòng liên hệ trực tiếp.",
+            )
             _cleanup_conv(job_id)
             return
 
+        # Preserve tried list across retries
+        tried = list(exclude) + [sre_info["id"]]
         _debug_jobs[job_id] = {
             "requester_chat_id": chat_id,
             "requester_name": requester_name,
@@ -1204,6 +1214,7 @@ async def _debug_forward_to_sre(
             "text": text,
             "sre_id": sre_info["id"],
             "task_kind": task_kind,
+            "tried_sres": tried,
         }
 
         sre_telegram = str(sre_info["telegram_id"])
