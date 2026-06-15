@@ -361,7 +361,18 @@ async def _handle_conversation_reply(chat_id: str, text: str, name: str):
             )
             await bot.send_message(chat_id, "📤 Đã gửi cho SRE. Chờ xác nhận...")
         else:
-            await bot.send_message(chat_id, "⏳ Task đang chờ SRE nhận. Thông tin đã ghi nhận.")
+            # SRE chưa accept → re-forward job gốc kèm message mới
+            orig_job = _debug_jobs.get(conv["job_id"], {})
+            if orig_job:
+                orig_text = orig_job.get("text", "")
+                orig_service = orig_job.get("service", service)
+                combined = f"{orig_text}\n\n📎 Thêm từ requester: {text}" if text != orig_text else orig_text
+                await bot.send_message(chat_id, "🔁 SRE chưa nhận task — đang gửi lại...")
+                asyncio.create_task(
+                    _debug_forward_to_sre(conv["job_id"], combined, chat_id, name, orig_service, task_kind=orig_job.get("task_kind", "k8s"))
+                )
+            else:
+                await bot.send_message(chat_id, "⏳ Task đang chờ SRE nhận. Thông tin đã ghi nhận.")
         return
 
     if conv["role"] == "sre":
