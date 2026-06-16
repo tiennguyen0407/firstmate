@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from langgraph.graph import StateGraph, START, END
 import os
 from greennode_agent_bridge import AgentBaseMemoryEvents
 
 from manager.state import FirstMateState
+
+logger = logging.getLogger(__name__)
 from manager.nodes.investigate import investigate
 from manager.nodes.assign_sre import assign_sre, assign_lead
 from manager.nodes.waiting_nodes import waiting_sre, waiting_runner, waiting_lead
@@ -96,12 +99,81 @@ def build_graph() -> StateGraph:
     builder.add_edge("report_result", END)
     builder.add_edge("escalated",     END)
 
+    memory_id = os.environ["AGENTBASE_MEMORY_ID"]
+    logger.info(f"[Memory] Initializing AgentBaseMemoryEvents with memory_id={memory_id}")
+    checkpointer = LoggedCheckpointer(memory_id=memory_id)
+
     return builder.compile(
-        checkpointer=AgentBaseMemoryEvents(
-            memory_id=os.environ["AGENTBASE_MEMORY_ID"],
-        ),
+        checkpointer=checkpointer,
         interrupt_before=["waiting_sre", "waiting_runner", "waiting_lead"],
     )
+
+
+class LoggedCheckpointer(AgentBaseMemoryEvents):
+    """AgentBaseMemoryEvents with logging on put/get calls."""
+
+    def __init__(self, memory_id: str):
+        super().__init__(memory_id=memory_id)
+
+    def put(self, config, checkpoint, metadata, new_versions):
+        thread_id = config.get("configurable", {}).get("thread_id", "?")
+        actor_id = config.get("configurable", {}).get("actor_id", "?")
+        node = (metadata or {}).get("source", "?")
+        logger.info(f"[Memory] PUT thread={thread_id} actor={actor_id} node={node}")
+        try:
+            result = super().put(config, checkpoint, metadata, new_versions)
+            logger.info(f"[Memory] PUT OK thread={thread_id}")
+            return result
+        except Exception as exc:
+            logger.error(f"[Memory] PUT FAILED thread={thread_id}: {exc}")
+            raise
+
+    async def aput(self, config, checkpoint, metadata, new_versions):
+        thread_id = config.get("configurable", {}).get("thread_id", "?")
+        actor_id = config.get("configurable", {}).get("actor_id", "?")
+        node = (metadata or {}).get("source", "?")
+        logger.info(f"[Memory] APUT thread={thread_id} actor={actor_id} node={node}")
+        try:
+            result = await super().aput(config, checkpoint, metadata, new_versions)
+            logger.info(f"[Memory] APUT OK thread={thread_id}")
+            return result
+        except Exception as exc:
+            logger.error(f"[Memory] APUT FAILED thread={thread_id}: {exc}")
+            raise
+
+    def get_tuple(self, config):
+        thread_id = config.get("configurable", {}).get("thread_id", "?")
+        logger.info(f"[Memory] GET thread={thread_id}")
+        try:
+            result = super().get_tuple(config)
+            found = result is not None
+            logger.info(f"[Memory] GET thread={thread_id} found={found}")
+            return result
+        except Exception as exc:
+            logger.error(f"[Memory] GET FAILED thread={thread_id}: {exc}")
+            raise
+
+    async def aget_tuple(self, config):
+        thread_id = config.get("configurable", {}).get("thread_id", "?")
+        logger.info(f"[Memory] AGET thread={thread_id}")
+        try:
+            result = await super().aget_tuple(config)
+            found = result is not None
+            logger.info(f"[Memory] AGET thread={thread_id} found={found}")
+            return result
+        except Exception as exc:
+            logger.error(f"[Memory] AGET FAILED thread={thread_id}: {exc}")
+            raise
+
+    def list(self, config, **kwargs):
+        thread_id = config.get("configurable", {}).get("thread_id", "?")
+        logger.info(f"[Memory] LIST thread={thread_id}")
+        return super().list(config, **kwargs)
+
+    async def alist(self, config, **kwargs):
+        thread_id = config.get("configurable", {}).get("thread_id", "?")
+        logger.info(f"[Memory] ALIST thread={thread_id}")
+        return super().alist(config, **kwargs)
 
 
 graph = build_graph()
