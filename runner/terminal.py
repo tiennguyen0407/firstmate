@@ -339,7 +339,7 @@ try:
     req = urllib.request.Request(
         url, data=payload, headers={"Content-Type": "application/json"}
     )
-    resp = urllib.request.urlopen(req, timeout=15)
+    resp = urllib.request.urlopen(req, timeout=30)
     body = resp.read().decode()
     print(f"[notify] OK: {body}", flush=True)
 except urllib.error.HTTPError as e:

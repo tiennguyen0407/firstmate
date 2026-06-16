@@ -12,7 +12,11 @@ from collections import deque
 from fastapi import APIRouter, Request
 from langgraph.types import Command
 from pydantic import BaseModel
+import httpx
+import telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot, CallbackQuery
+from telegram.error import TimedOut as TelegramTimedOut
+from telegram.request import HTTPXRequest
 
 from manager.graph import graph
 from shared.models import JobStatus
@@ -123,8 +127,30 @@ async def _fetch_dynamic_kb(chat_id: str) -> dict | None:
 def get_bot() -> Bot:
     global _bot
     if _bot is None:
-        _bot = Bot(token=os.environ["TELEGRAM_BOT_TOKEN"])
+        _bot = Bot(
+            token=os.environ["TELEGRAM_BOT_TOKEN"],
+            request=HTTPXRequest(
+            read_timeout=30,
+            connect_timeout=20,
+            write_timeout=30,
+            # Không tái dùng connection cũ — tránh stale connection timeout
+            httpx_kwargs={"limits": httpx.Limits(
+                max_connections=16,
+                max_keepalive_connections=8,
+                keepalive_expiry=60,
+            )},
+        ),
+        )
     return _bot
+
+
+async def _tg_send(chat_id: str, text: str, **kwargs) -> None:
+    """send_message with one retry on stale-connection timeout."""
+    try:
+        await get_bot().send_message(chat_id, text, **kwargs)
+    except TelegramTimedOut:
+        logger.warning(f"[TG] send_message timeout, retrying (chat={chat_id})")
+        await get_bot().send_message(chat_id, text, **kwargs)
 
 
 async def _safe_task(coro, chat_id: str):
@@ -193,7 +219,7 @@ async def _dispatch_update(update: Update):
         lines.append(f"\n*Recent errors* ({len(error_log)}):")
         for e in list(error_log)[-5:]:
             lines.append(f"  • {str(e.get('error',''))[:120]}")
-        await get_bot().send_message(chat_id, "\n".join(lines), parse_mode="Markdown")
+        await _tg_send(chat_id, "\n".join(lines), parse_mode="Markdown")
         return
 
     if text == "/kb":
@@ -231,7 +257,10 @@ async def _dispatch_update(update: Update):
 async def telegram_webhook(request: Request):
     data = await request.json()
     update = Update.de_json(data, get_bot())
-    await _dispatch_update(update)
+    try:
+        await _dispatch_update(update)
+    except Exception as exc:
+        logger.error(f"webhook dispatch error (returning 200 to avoid Telegram retry): {exc}")
     return {"ok": True}
 
 
@@ -269,7 +298,7 @@ async def _route_message(chat_id: str, text: str, name: str):
 
     # Dev/QC → classify + pre-analyze memory trong 1 LLM call
     bot = get_bot()
-    await bot.send_message(chat_id, "⌛ Đang phân tích...")
+    await _tg_send(chat_id, "⌛ Đang phân tích...")
 
     history = list(_chat_history.get(chat_id, []))
     mem_ctx, dkb = await asyncio.gather(
@@ -1230,13 +1259,17 @@ Action thiếu context (không biết service):
 {{"type": "clarify", "context": "new_task"|"followup", "service": null, "task_kind": "k8s", "inferred": "mô tả đầy đủ nhất có thể", "question": "Câu hỏi ngắn gọn"}}
 
 === PHÂN LOẠI type ===
-- knowledge: dùng khi CÓ THỂ trả lời mà KHÔNG cần truy cập live system:
+- knowledge: CHỈ dùng cho thông tin TĨNH, không thay đổi theo thời gian:
   1. Câu hỏi kiến thức tĩnh (định nghĩa, tính toán mạng)
-  2. Thông tin ĐÃ CÓ trong MEMORY hoặc lịch sử trò chuyện (kết quả check trước, trạng thái pod đã biết)
-  VD: "statefulset là gì", "subnet /28 có bao nhiêu host"
-  VD (từ memory): "số pod loyalty bao nhiêu?" nếu MEMORY đã có kết quả check gần đây
+  2. Service thuộc namespace nào (từ Dynamic KB hoặc Memory)
+  3. Gateway IP, log path (từ Dynamic KB hoặc Memory)
+  KHÔNG dùng knowledge cho: số pod, số replica, trạng thái pod, tên pod cụ thể,
+  resource usage — những thứ này thay đổi liên tục, PHẢI check live dù memory đã có.
+  VD knowledge: "statefulset là gì", "loyalty-biz-tool ở namespace nào"
+  VD KHÔNG phải knowledge: "có bao nhiêu pod", "pod nào đang chạy", "replica hiện tại là mấy"
 - gateway_log: kiểm tra nginx gateway log (có domain 2+ dấu chấm, hoặc "log gateway")
-- k8s: kiểm tra/thay đổi pod/deployment/service Kubernetes
+- k8s: kiểm tra/thay đổi pod/deployment/service Kubernetes — BẮT BUỘC dùng khi hỏi về
+  số pod, replica count, pod status, resource (cpu/mem), events, logs
 
 === PHÂN LOẠI context ===
 - "followup": message là phần tiếp theo của cuộc trò chuyện hiện tại trong lịch sử
@@ -1316,7 +1349,10 @@ async def _classify_and_respond(
 ):
     """Unified entry: 1 LLM call để classify + synthesize + pre-analyze memory."""
     bot = get_bot()
-    await bot.send_message(chat_id, "⌛ Đang phân tích...")
+    try:
+        await _tg_send(chat_id, "⌛ Đang phân tích...")
+    except Exception:
+        logger.warning(f"ack failed twice for chat={chat_id}, continuing without ack")
 
     history = list(_chat_history.get(chat_id, []))
     mem_ctx, dkb = await asyncio.gather(
@@ -1341,7 +1377,7 @@ async def _classify_and_respond(
             await _send_long_message(chat_id, _md_to_html(answer))
             _add_to_history(chat_id, answer, role="assistant")
         else:
-            await bot.send_message(chat_id, "⚠️ Không có câu trả lời.")
+            await _tg_send(chat_id, "⚠️ Không có câu trả lời.")
     elif rtype == "action":
         svc = result.get("service") or detected_service
         task_desc = result.get("task_description")
@@ -1363,11 +1399,7 @@ async def _classify_and_respond(
                 "task_kind": result.get("task_kind", "k8s"),
                 "service": None,
             }
-            await bot.send_message(
-                chat_id,
-                "Bạn muốn thực hiện yêu cầu này trên service nào?",
-                parse_mode="Markdown",
-            )
+            await _tg_send(chat_id, "Bạn muốn thực hiện yêu cầu này trên service nào?", parse_mode="Markdown")
         else:
             await _start_new_task(
                 chat_id, text, requester_name,
@@ -1385,11 +1417,7 @@ async def _classify_and_respond(
             "service": service,
         }
         question = result.get("question") or f'Có phải bạn muốn "{result.get("inferred", text)}" không?'
-        await bot.send_message(
-            chat_id,
-                question,
-            parse_mode="Markdown",
-        )
+        await _tg_send(chat_id, question, parse_mode="Markdown")
     else:
         await _ask_task_kind(chat_id, text, requester_name)
 
@@ -1780,41 +1808,45 @@ async def job_complete(payload: _ClaudeDonePayload):
         return {"ok": False, "error": "job not found"}
 
     job["claude_summary"] = payload.summary
-    # Note: summary saved to memory later when SRE clicks verify:done (avoids duplicate)
 
-    # Tìm SRE chat_id từ active conv
+    # Trả về ngay để Runner không bị timeout, xử lý notify async
+    asyncio.create_task(_notify_job_complete(payload.job_id))
+    return {"ok": True}
+
+
+async def _notify_job_complete(job_id: str):
+    """Gửi kết quả cho SRE qua Telegram (chạy async sau khi /job-complete đã trả về)."""
+    job = _debug_jobs.get(job_id)
+    if not job:
+        return
+
     sre_chat = next(
         (cid for cid, c in _active_conv.items()
-         if c.get("job_id") == payload.job_id and c.get("role") == "sre"),
+         if c.get("job_id") == job_id and c.get("role") == "sre"),
         None,
     )
     if not sre_chat:
-        # Fallback: dùng sre_chat_id đã lưu khi SRE accept (tồn tại dù _active_conv bị clear)
         sre_chat = job.get("sre_chat_id")
     if not sre_chat:
-        logger.warning(f"job-complete: no SRE chat_id for job={payload.job_id[:8]}")
-        return {"ok": False, "error": "no SRE chat_id — SRE chưa accept task?"}
+        logger.warning(f"job-complete: no SRE chat_id for job={job_id[:8]}")
+        return
 
-    html_summary = _md_to_html(payload.summary)
+    html_summary = _md_to_html(job["claude_summary"])
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Đã verify, gửi kết quả", callback_data=f"verify:done:{payload.job_id}"),
-        InlineKeyboardButton("🔍 Cần check thêm",         callback_data=f"verify:more:{payload.job_id}"),
+        InlineKeyboardButton("✅ Đã verify, gửi kết quả", callback_data=f"verify:done:{job_id}"),
+        InlineKeyboardButton("🔍 Cần check thêm",         callback_data=f"verify:more:{job_id}"),
     ]])
-    header = f"🤖 <b>FirstMate đã điều tra xong!</b>\n\n📊 <b>Kết quả:</b>\n"
+    header = "🤖 <b>FirstMate đã điều tra xong!</b>\n\n📊 <b>Kết quả:</b>\n"
     full_msg = header + html_summary + "\n\nVui lòng verify và xác nhận:"
     try:
         if len(full_msg) <= 4000:
-            # Vừa một message → đính keyboard luôn
-            await get_bot().send_message(sre_chat, full_msg, reply_markup=keyboard, parse_mode="HTML")
+            await _tg_send(sre_chat, full_msg, reply_markup=keyboard, parse_mode="HTML")
         else:
-            # Quá dài → gửi toàn bộ nội dung trước (tự động split), keyboard ở message cuối
             await _send_long_message(sre_chat, header + html_summary)
-            await get_bot().send_message(sre_chat, "Vui lòng verify và xác nhận:", reply_markup=keyboard, parse_mode="HTML")
+            await _tg_send(sre_chat, "Vui lòng verify và xác nhận:", reply_markup=keyboard, parse_mode="HTML")
+        logger.info(f"job-complete notified SRE={sre_chat} job={job_id[:8]}")
     except Exception as exc:
-        logger.error(f"job-complete send_message failed: {exc}")
-        return {"ok": False, "error": f"send_message failed: {exc}"}
-    logger.info(f"job-complete notified SRE={sre_chat} job={payload.job_id[:8]}")
-    return {"ok": True}
+        logger.error(f"job-complete notify failed: {exc}")
 
 
 # ══════════════════════════════════════════════════════════════════

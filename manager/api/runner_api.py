@@ -20,7 +20,8 @@ async def register(info: RunnerInfo):
 @router.post("/heartbeat/{runner_id}")
 async def heartbeat(runner_id: str):
     if not runner_registry.heartbeat(runner_id):
-        raise HTTPException(status_code=404, detail="Runner not registered")
+        # Runner bị mất khỏi registry (manager restart) — yêu cầu re-register
+        raise HTTPException(status_code=410, detail="Runner lost after restart, please re-register")
     return {"status": "ok"}
 
 
