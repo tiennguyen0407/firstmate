@@ -51,7 +51,7 @@ def _write_claude_md(d: Path, job: Job) -> None:
         "",
         "## Yêu cầu",
         "",
-        job.description,
+        job.synthesized_prompt or job.description,
     ]
     if job.commands:
         lines += ["", "## Commands gợi ý", ""]

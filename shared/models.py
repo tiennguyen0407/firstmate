@@ -48,6 +48,7 @@ class Job(BaseModel):
     assigned_sre: Optional[str] = None
     status: JobStatus = JobStatus.PENDING
     prev_summary: Optional[str] = None  # kết quả điều tra trước (follow-up tasks)
+    synthesized_prompt: Optional[str] = None  # manager-synthesized task description for Claude Code
 
 
 class TaskResult(BaseModel):
