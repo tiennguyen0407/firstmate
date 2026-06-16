@@ -23,39 +23,25 @@ router = APIRouter(prefix="/webhook", tags=["telegram"])
 # ── Config ────────────────────────────────────────────────────────
 DEBUG_MODE = os.getenv("DEBUG", "false").lower() == "true"
 
-# ── AgentBase Memory client (DEBUG mode) ─────────────────────────
-_MEMORY_ID = os.getenv("AGENTBASE_MEMORY_ID", "")
-_memory_client = None
+# ── AgentBase Memory service ──────────────────────────────────────
 
-def _get_memory_client():
-    global _memory_client
-    if _memory_client is None and _MEMORY_ID:
-        try:
-            from greennode_agentbase.memory import MemoryClient
-            _memory_client = MemoryClient()
-            logger.info(f"[Memory] MemoryClient initialized, memory_id={_MEMORY_ID}")
-        except Exception as exc:
-            logger.warning(f"[Memory] Failed to init MemoryClient: {exc}")
-    return _memory_client
-
-async def _save_event(actor_id: str, session_id: str, role: str, content: str):
-    """Save a conversation event to AgentBase Memory (best-effort, non-blocking)."""
-    if not _MEMORY_ID:
-        return
+async def _save_memory(actor_id: str, content: str, role: str = "user",
+                       session_id: str = ""):
+    """Save conversation event to AgentBase Memory (best-effort, non-blocking)."""
     try:
-        client = _get_memory_client()
-        if not client:
+        from manager.services.memory_save import get_memory_service
+        svc = get_memory_service()
+        if not svc:
             return
-        from greennode_agentbase.memory.models import EventCreateRequest, EventPayload
-        request = EventCreateRequest(
-            payload=EventPayload(type="conversational", role=role, message=content)
+        result = await svc.save(
+            actor_id=actor_id,
+            content=content,
+            source="conversation",
+            metadata={"role": role, "session_id": session_id},
         )
-        await client.create_event_async(
-            id=_MEMORY_ID, actorId=actor_id, sessionId=session_id, request=request
-        )
-        logger.info(f"[Memory] Saved event actor={actor_id} session={session_id[:8]} role={role} len={len(content)}")
+        logger.info(f"[Memory] {result.get('status')} actor={actor_id} role={role} len={len(content)}")
     except Exception as exc:
-        logger.error(f"[Memory] Failed to save event: {exc}")
+        logger.error(f"[Memory] save failed: {exc}")
 
 # ── Error log ────────────────────────────────────────────────────
 error_log: deque = deque(maxlen=100)
@@ -73,14 +59,23 @@ _chat_history: dict[str, deque] = {}
 _MAX_HISTORY = 20
 
 
+_last_saved: dict[str, str] = {}  # chat_id → last content hash (dedup)
+
 def _add_to_history(chat_id: str, content: str, role: str = "user") -> None:
     if chat_id not in _chat_history:
         _chat_history[chat_id] = deque(maxlen=_MAX_HISTORY)
     _chat_history[chat_id].append(content)
-    # Save to AgentBase Memory (non-blocking)
+    # Dedup: skip if same chat_id + role + content just saved
+    dedup_key = f"{chat_id}:{role}:{content[:100]}"
+    if _last_saved.get(chat_id) == dedup_key:
+        return
+    _last_saved[chat_id] = dedup_key
+    # Save event to AgentBase Memory (non-blocking)
     conv = _active_conv.get(chat_id, {})
     session_id = conv.get("job_id", f"chat-{chat_id}")
-    asyncio.ensure_future(_save_event(actor_id=chat_id, session_id=session_id, role=role, content=content))
+    asyncio.ensure_future(_save_memory(
+        actor_id=chat_id, content=content, role=role, session_id=session_id,
+    ))
 
 
 _bot: Bot | None = None
@@ -318,10 +313,128 @@ async def _route_message(chat_id: str, text: str, name: str):
         await _handle_conversation_reply(chat_id, text, name)
 
 
+# ══════════════════════════════════════════════════════════════════
+# PRE-ANALYSIS — read memory before escalating to SRE
+# ══════════════════════════════════════════════════════════════════
+
+async def _pre_analyze_with_memory(chat_id: str, text: str, service: str) -> str | None:
+    """Read short-term memory and try to answer without SRE.
+
+    Returns an answer string if AI can handle it, or None if SRE escalation needed.
+    """
+    try:
+        from manager.services.memory_save import get_memory_service
+        svc = get_memory_service()
+
+        # Gather context: local history + memory events
+        local_history = list(_chat_history.get(chat_id, []))
+        memory_events = []
+        if svc:
+            memory_events = await svc.get_all_recent_events(actor_id=chat_id, limit=20)
+
+        # Build context string from memory
+        memory_context = ""
+        if memory_events:
+            lines = []
+            for evt in memory_events[-15:]:  # last 15 events
+                role = evt.get("role", "?")
+                msg = evt.get("message", "")[:500]
+                lines.append(f"[{role}] {msg}")
+            memory_context = "\n".join(lines)
+
+        # If no memory context and no local history, can't pre-analyze
+        if not memory_context and not local_history:
+            return None
+
+        from langchain_openai import ChatOpenAI
+        from langchain_core.messages import SystemMessage, HumanMessage
+        from manager.services.kb_loader import format_for_prompt as kb_prompt
+
+        llm = ChatOpenAI(
+            model="qwen/qwen3-5-27b",
+            base_url="https://maas-llm-aiplatform-hcm.api.vngcloud.vn/v1",
+            api_key=os.environ["GREENNODE_API_KEY"],
+            temperature=0,
+            max_tokens=2048,
+            timeout=15,
+            max_retries=0,
+        )
+
+        kb = kb_prompt() or ""
+        system = (
+            "/no_think\n"
+            "Bạn là FirstMate — AI assistant DevOps/SRE.\n\n"
+            "NHIỆM VỤ: Phân tích yêu cầu của user dựa trên context có sẵn. "
+            "Trả lời user TRƯỚC nếu có thể, CHỈ escalate SRE khi thật sự cần.\n\n"
+            "BẠN CÓ THỂ TRẢ LỜI khi:\n"
+            "- Thông tin đã có trong memory/context (kết quả check trước đó)\n"
+            "- Câu hỏi về kiến thức DevOps/K8s chung\n"
+            "- So sánh, tổng hợp từ dữ liệu đã thu thập\n"
+            "- Giải thích lỗi/log đã có trong context\n\n"
+            "CHỈ ESCALATE SRE khi:\n"
+            "- Cần truy cập live system (kubectl, SSH, DB, Redis)\n"
+            "- Cần quyền admin/production\n"
+            "- Cần kiểm tra log/metric realtime\n"
+            "- Memory không đủ thông tin để kết luận\n"
+            "- Có nguy cơ incident, mất dữ liệu, bảo mật\n\n"
+            "TRẢ VỀ JSON:\n"
+            '- Tự trả lời: {"can_answer": true, "answer": "<Markdown tiếng Việt>"}\n'
+            '- Cần SRE: {"can_answer": false, "reason": "<lý do cụ thể cần SRE check gì>"}\n\n'
+            "Khi escalate, nói CỤ THỂ SRE cần check gì, ví dụ:\n"
+            '"Cần SRE check logs của pod loyalty-tier-core trong namespace production vì memory không có thông tin lỗi gần đây."\n\n'
+            "KHÔNG nói chung chung 'hãy hỏi SRE kiểm tra'.\n"
+        )
+        if kb:
+            system += f"\n--- Knowledge Base ---\n{kb}\n"
+
+        user_msg = f"Service: {service}\nYêu cầu: {text}\n"
+        if memory_context:
+            user_msg += f"\n--- Short-term memory (recent events) ---\n{memory_context}\n"
+        if local_history:
+            user_msg += f"\n--- Chat history ---\n" + "\n".join(local_history[-5:]) + "\n"
+
+        response = await llm.ainvoke([
+            SystemMessage(content=system),
+            HumanMessage(content=user_msg),
+        ])
+
+        raw = response.content.strip()
+        raw = _strip_think_tags(raw)
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
+
+        result = json.loads(raw)
+
+        if result.get("can_answer"):
+            answer = result.get("answer", "")
+            if answer and len(answer) >= 20:
+                logger.info(f"[PreAnalysis] answered from memory chat={chat_id} len={len(answer)}")
+                return answer
+
+        # Can't answer — log reason for debugging
+        reason = result.get("reason", "unknown")
+        logger.info(f"[PreAnalysis] escalate chat={chat_id} reason={reason[:100]}")
+        return None
+
+    except Exception as exc:
+        logger.warning(f"[PreAnalysis] failed, escalating: {exc}")
+        return None
+
+
 async def _start_new_task(chat_id: str, text: str, requester_name: str, task_kind: str = "k8s", service: str | None = None):
-    """Tạo job mới (đã thoát conv hoặc chưa có conv)."""
+    """Tạo job mới — nhưng trước hết phân tích memory xem có thể trả lời không cần SRE."""
     if service is None or service == "unknown":
         service = _detect_service(text)
+
+    # ── Pre-analysis: read memory → try to answer before escalating ──
+    pre_result = await _pre_analyze_with_memory(chat_id, text, service)
+    if pre_result:
+        # AI answered without SRE — done
+        await _send_long_message(chat_id, _md_to_html(pre_result))
+        _add_to_history(chat_id, pre_result, role="assistant")
+        return
+
+    # ── Need SRE — escalate ──
     job_id = str(uuid.uuid4())
 
     if DEBUG_MODE:
@@ -449,12 +562,14 @@ async def _handle_conversation_reply(chat_id: str, text: str, name: str):
         if intent == "complete":
             # Thông báo Dev/QC
             if requester:
+                complete_msg = f"✅ SRE {name} báo hoàn thành\n\n{summary}"
                 await bot.send_message(
                     requester,
                     f"✅ *SRE {name} báo hoàn thành*\n\n{summary}\n\n"
                     f"_Có yêu cầu tiếp theo? Nhắn thẳng vào đây hoặc dùng /follow <action>._",
                     parse_mode="Markdown",
                 )
+                _add_to_history(requester, complete_msg, role="assistant")
             await bot.send_message(chat_id, "✅ Task hoàn thành. Conv đã đóng.")
             # Đánh dấu dev/qc conv completed (giữ để hỏi lại nếu follow-up thiếu context)
             if requester and requester in _active_conv:
@@ -529,21 +644,25 @@ async def _handle_conversation_reply(chat_id: str, text: str, name: str):
         elif intent == "question":
             # SRE hỏi Dev/QC → forward
             if requester:
+                question_msg = f"❓ SRE {name} hỏi:\n\n{text}"
                 await bot.send_message(
                     requester,
                     f"❓ *SRE {name} hỏi*:\n\n{text}\n\n_Trả lời thẳng vào đây để SRE nhận được._",
                     parse_mode="Markdown",
                 )
+                _add_to_history(requester, question_msg, role="assistant")
             await bot.send_message(chat_id, "📨 Đã gửi câu hỏi tới requester. Chờ phản hồi...")
 
         else:
             # update / other → forward cho Dev/QC như status update
             if requester:
+                update_msg = f"📊 SRE {name} cập nhật:\n\n{summary}"
                 await bot.send_message(
                     requester,
                     f"📊 *SRE {name} cập nhật*:\n\n{summary}",
                     parse_mode="Markdown",
                 )
+                _add_to_history(requester, update_msg, role="assistant")
             await bot.send_message(chat_id, "📨 Đã gửi cập nhật cho requester.")
 
 
@@ -551,9 +670,23 @@ async def _handle_conversation_reply(chat_id: str, text: str, name: str):
 # CALLBACK HANDLER — xử lý button clicks (dbg/sre/lead)
 # ══════════════════════════════════════════════════════════════════
 
+async def _safe_edit(query: CallbackQuery, text: str = None, reply_markup=None):
+    """Edit callback message, ignoring expired query errors."""
+    try:
+        if text is not None:
+            await query.edit_message_text(text)
+        if reply_markup is not None:
+            await query.edit_message_reply_markup(reply_markup=reply_markup)
+    except Exception:
+        pass  # query expired or message unchanged
+
+
 async def _handle_callback(query: CallbackQuery):
     try:
-        await query.answer()
+        try:
+            await query.answer()
+        except Exception:
+            pass  # query already expired, continue processing
         parts = query.data.split(":")
         if len(parts) != 3:
             return
@@ -571,10 +704,7 @@ async def _handle_callback(query: CallbackQuery):
             name = conv.get("requester_name", "?")
             del _active_conv[user_chat_id]
             label = "🌐 Gateway log" if task_kind == "gateway_log" else "☸️ Kubernetes"
-            await query.edit_message_text(
-                f"Yêu cầu: _{original_text}_\nLoại: *{label}*",
-                parse_mode="Markdown",
-            )
+            await _safe_edit(query, text=f"Yêu cầu: {original_text}\nLoại: {label}")
             await _maybe_clarify_action(user_chat_id, original_text, name, task_kind=task_kind)
             return
 
@@ -595,7 +725,7 @@ async def _handle_callback(query: CallbackQuery):
         if kind == "dbg":
             job_meta = _debug_jobs.get(job_id)
             if not job_meta:
-                await query.edit_message_text("⚠️ Job không tìm thấy (server đã restart).")
+                await _safe_edit(query, text="⚠️ Job không tìm thấy (server đã restart).")
                 return
 
             requester = job_meta["requester_chat_id"]
@@ -644,17 +774,17 @@ async def _handle_callback(query: CallbackQuery):
                     f"_Bạn có thể nhắn thêm thông tin bất cứ lúc nào._",
                     parse_mode="Markdown",
                 )
-                await query.edit_message_text(
+                await _safe_edit(query, text=(
                     f"✅ Đã nhận task\n"
                     f"Service: {job_meta['service']}\n\n"
                     f"Runner đang mở terminal Claude Code...\n"
                     f"Nhắn tin vào đây để cập nhật trạng thái (xong/cần lead/chuyển task)."
-                )
+                ))
 
             elif action in ("busy", "declined"):
                 label = "đang bận" if action == "busy" else "từ chối task"
                 icon = "🔄" if action == "busy" else "❌"
-                await query.edit_message_text(f"{icon} Đã báo {label}.")
+                await _safe_edit(query, text=f"{icon} Đã báo {label}.")
                 await get_bot().send_message(
                     requester,
                     f"{icon} *{sre_name}* {label}. Đang tìm SRE khác...",
@@ -676,7 +806,7 @@ async def _handle_callback(query: CallbackQuery):
         elif kind == "verify":
             job_meta = _debug_jobs.get(job_id)
             if not job_meta:
-                await query.edit_message_text("⚠️ Job không tìm thấy.")
+                await _safe_edit(query, text="⚠️ Job không tìm thấy.")
                 return
 
             requester = job_meta.get("requester_chat_id")
@@ -703,7 +833,7 @@ async def _handle_callback(query: CallbackQuery):
                     if requester in _active_conv:
                         _active_conv[requester]["status"] = "completed"
                 try:
-                    await query.edit_message_reply_markup(reply_markup=None)
+                    await _safe_edit(query, reply_markup=None)
                 except Exception:
                     pass
                 await get_bot().send_message(sre_chat_id, "✅ Đã gửi kết quả. Task hoàn thành.")
@@ -721,7 +851,7 @@ async def _handle_callback(query: CallbackQuery):
                     )
                 # Xóa buttons nhưng giữ nguyên nội dung summary
                 try:
-                    await query.edit_message_reply_markup(reply_markup=None)
+                    await _safe_edit(query, reply_markup=None)
                 except Exception:
                     pass
                 await get_bot().send_message(
@@ -741,20 +871,20 @@ async def _handle_callback(query: CallbackQuery):
                 interrupt_data = state.tasks[0].interrupts[0].value if state.tasks else {}
                 requester = result.get("requester_telegram_id", "")
                 await _handle_langgraph_interrupt(job_id, next_node, interrupt_data, requester)
-                await query.edit_message_text(f"✅ Đã nhận: {action}")
+                await _safe_edit(query, text=f"✅ Đã nhận: {action}")
             else:
                 final = result.get("final_report") or "✅ Xử lý xong."
                 requester_id = result.get("requester_telegram_id", "")
                 if requester_id:
                     await get_bot().send_message(requester_id, final, parse_mode="Markdown")
-                await query.edit_message_text(f"✅ Hoàn thành — {action}")
+                await _safe_edit(query, text=f"✅ Hoàn thành — {action}")
 
     except Exception as exc:
         tb = traceback.format_exc()
         error_log.append({"error": str(exc), "traceback": tb})
         logger.error(f"callback error: {exc}\n{tb}")
         try:
-            await query.edit_message_text(f"❌ Lỗi: {type(exc).__name__}: {str(exc)[:200]}")
+            await _safe_edit(query, text=f"❌ Lỗi: {type(exc).__name__}: {str(exc)[:200]}")
         except Exception:
             pass
 
@@ -1022,6 +1152,7 @@ async def _classify_and_respond(chat_id: str, text: str, requester_name: str):
             if not answer:
                 raise ValueError("LLM returned no answer for knowledge question")
             await _send_long_message(chat_id, _md_to_html(answer))
+            _add_to_history(chat_id, answer, role="assistant")
         except Exception as exc:
             err = f"{type(exc).__name__}: {str(exc)[:300]}"
             error_log.append({"error": err, "source": "answer_knowledge"})
@@ -1387,12 +1518,7 @@ async def job_complete(payload: _ClaudeDonePayload):
         return {"ok": False, "error": "job not found"}
 
     job["claude_summary"] = payload.summary
-
-    # Save Claude investigation result to AgentBase Memory
-    requester = job.get("requester_chat_id", "")
-    if requester:
-        session_id = payload.job_id
-        _add_to_history(requester, payload.summary, role="assistant")
+    # Note: summary saved to memory later when SRE clicks verify:done (avoids duplicate)
 
     # Tìm SRE chat_id từ active conv
     sre_chat = next(
