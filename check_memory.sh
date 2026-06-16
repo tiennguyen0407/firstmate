@@ -1,13 +1,25 @@
 #!/usr/bin/env bash
 # check_memory.sh — Xem toàn bộ memory của FirstMate
-# Usage: bash check_memory.sh [actor_id]
-#        bash check_memory.sh all         — xem tất cả actors
+# Usage: bash check_memory.sh <actor_id|all>
+#
+# Yêu cầu env vars (auto-loaded từ .env.local nếu tồn tại):
+#   MEMORY_AGENT_URL     — URL của firstmate-memory runtime
+#   AGENTBASE_MEMORY_ID  — Memory store ID
 
 set -euo pipefail
 
+# Auto-source .env.local nếu tồn tại và chưa set env vars
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${SCRIPT_DIR}/.env.local" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/.env.local"
+  set +a
+fi
+
 MEMORY_AGENT_URL="${MEMORY_AGENT_URL:?MEMORY_AGENT_URL is required (set in .env.local)}"
 MEMORY_ID="${AGENTBASE_MEMORY_ID:?AGENTBASE_MEMORY_ID is required (set in .env.local)}"
-SCRIPTS_DIR=".claude/skills/agentbase/scripts"
+SCRIPTS_DIR="${SCRIPT_DIR}/.claude/skills/agentbase/scripts"
 
 # ── Helpers ───────────────────────────────────────────────────────
 
