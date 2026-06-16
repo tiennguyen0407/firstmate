@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import asyncio
+import re
 import traceback
 import uuid
 from collections import deque
@@ -58,6 +59,8 @@ _active_conv: dict[str, dict] = {}
 _chat_history: dict[str, deque] = {}
 _MAX_HISTORY = 20
 
+# chat_id → structured facts từ Memory Consolidator Agent
+_dynamic_kb: dict[str, dict] = {}
 
 _last_saved: dict[str, str] = {}  # chat_id → last content hash (dedup)
 
@@ -70,15 +73,51 @@ def _add_to_history(chat_id: str, content: str, role: str = "user") -> None:
     if _last_saved.get(chat_id) == dedup_key:
         return
     _last_saved[chat_id] = dedup_key
-    # Save event to AgentBase Memory (non-blocking)
-    conv = _active_conv.get(chat_id, {})
-    session_id = conv.get("job_id", f"chat-{chat_id}")
+    # Save event to AgentBase Memory — luôn dùng chat-{id} session (không per-job)
     asyncio.ensure_future(_save_memory(
-        actor_id=chat_id, content=content, role=role, session_id=session_id,
+        actor_id=chat_id, content=content, role=role, session_id=f"chat-{chat_id}",
     ))
 
 
 _bot: Bot | None = None
+
+
+async def _trigger_consolidation(chat_id: str) -> None:
+    """Trigger Memory Agent sau job hoàn thành — HTTP nếu có MEMORY_AGENT_URL, fallback in-process."""
+    memory_agent_url = os.environ.get("MEMORY_AGENT_URL", "").rstrip("/")
+    if memory_agent_url:
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=5) as client:
+                await client.post(f"{memory_agent_url}/consolidate/{chat_id}")
+            logger.info(f"[Consolidator] triggered via HTTP chat={chat_id}")
+        except Exception as exc:
+            logger.warning(f"[Consolidator] HTTP trigger failed, skipping: {exc}")
+    else:
+        try:
+            from manager.services.memory_consolidator import consolidate
+            facts = await consolidate(chat_id)
+            if facts:
+                _dynamic_kb[chat_id] = facts
+                logger.info(f"[Consolidator] dynamic_kb updated (in-process) chat={chat_id}")
+        except Exception as exc:
+            logger.warning(f"[Consolidator] in-process failed chat={chat_id}: {exc}")
+
+
+async def _fetch_dynamic_kb(chat_id: str) -> dict | None:
+    """Lấy dynamic KB từ Memory Agent (HTTP) hoặc in-process cache."""
+    memory_agent_url = os.environ.get("MEMORY_AGENT_URL", "").rstrip("/")
+    if memory_agent_url:
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=3) as client:
+                r = await client.get(f"{memory_agent_url}/kb/{chat_id}")
+                data = r.json()
+                return data if data else None
+        except Exception as exc:
+            logger.debug(f"[Consolidator] HTTP kb fetch failed chat={chat_id}: {exc}")
+            return None
+    return _dynamic_kb.get(chat_id)
 
 
 def get_bot() -> Bot:
@@ -113,19 +152,14 @@ async def _safe_task(coro, chat_id: str):
 # Telegram gửi callback_query đến cùng 1 URL với message
 # ══════════════════════════════════════════════════════════════════
 
-@router.post("/telegram")
-async def telegram_webhook(request: Request):
-    data = await request.json()
-    update = Update.de_json(data, get_bot())
-
-    # ── Callback query (button click) ────────────────────────────
+async def _dispatch_update(update: Update):
+    """Core routing — dùng bởi cả webhook (prod) lẫn polling (local dev)."""
     if update.callback_query:
         asyncio.create_task(_handle_callback(update.callback_query))
-        return {"ok": True}
+        return
 
-    # ── Regular message ──────────────────────────────────────────
     if not update.message or not update.message.text:
-        return {"ok": True}
+        return
 
     text = update.message.text.strip()
     chat_id = str(update.message.chat_id)
@@ -142,7 +176,7 @@ async def telegram_webhook(request: Request):
             f"_(DEBUG: {'ON' if DEBUG_MODE else 'OFF'})_",
             parse_mode="Markdown",
         )
-        return {"ok": True}
+        return
 
     if text == "/debug":
         from manager.services.kb_loader import _load_raw as _kb_raw
@@ -160,7 +194,7 @@ async def telegram_webhook(request: Request):
         for e in list(error_log)[-5:]:
             lines.append(f"  • {str(e.get('error',''))[:120]}")
         await get_bot().send_message(chat_id, "\n".join(lines), parse_mode="Markdown")
-        return {"ok": True}
+        return
 
     if text == "/kb":
         from manager.services.kb_loader import format_for_prompt as kb_fmt
@@ -169,30 +203,7 @@ async def telegram_webhook(request: Request):
             await get_bot().send_message(chat_id, "Knowledge Base trống. Xem `manager/config/knowledge_base.yaml`.")
         else:
             await _send_long_message(chat_id, _md_to_html(content))
-        return {"ok": True}
-
-    if text.startswith("/follow"):
-        action = text[len("/follow"):].strip()
-        if not action:
-            await get_bot().send_message(
-                chat_id,
-                "Usage: `/follow <action>`\n\nVí dụ:\n"
-                "• `/follow scale lên 13 pod`\n"
-                "• `/follow restart loyalty-reward-store`\n\n"
-                "_Firstmate sẽ dùng context từ task trước để điền service nếu thiếu._",
-                parse_mode="Markdown",
-            )
-            return {"ok": True}
-        # Đọc service từ conv cũ TRƯỚC khi xóa (dùng làm fallback nếu action không nêu rõ service)
-        prev_service = _active_conv.get(chat_id, {}).get("service")
-        if chat_id in _active_conv:
-            del _active_conv[chat_id]
-        _add_to_history(chat_id, action)
-        asyncio.create_task(_safe_task(
-            _classify_and_respond(chat_id, action, requester_name, detected_service=prev_service, force_action=True),
-            chat_id,
-        ))
-        return {"ok": True}
+        return
 
     # Ghi lịch sử (không ghi /commands)
     _add_to_history(chat_id, text)
@@ -205,19 +216,25 @@ async def telegram_webhook(request: Request):
             chat_id,
             "Không có task nào đang hoạt động. Nhắn yêu cầu mới nếu cần hỗ trợ.",
         )
-        return {"ok": True}
+        return
 
     # ── Nếu đang trong conv (active hoặc completed) → route ──────
     if chat_id in _active_conv:
         asyncio.create_task(_safe_task(_route_message(chat_id, text, requester_name), chat_id))
-        return {"ok": True}
+        return
 
     # ── Không trong conv → phân loại: câu hỏi hay action ──────────
     asyncio.create_task(_safe_task(_classify_and_respond(chat_id, text, requester_name), chat_id))
+
+
+@router.post("/telegram")
+async def telegram_webhook(request: Request):
+    data = await request.json()
+    update = Update.de_json(data, get_bot())
+    await _dispatch_update(update)
     return {"ok": True}
 
 
-# ── Giữ endpoint cũ để tránh 404 nếu có gì redirect đến ─────────
 @router.post("/telegram/callback")
 async def telegram_callback_legacy(request: Request):
     return {"ok": True}
@@ -250,13 +267,17 @@ async def _route_message(chat_id: str, text: str, name: str):
         await _handle_conversation_reply(chat_id, text, name)
         return
 
-    # Dev/QC → classify + synthesize trong 1 LLM call
+    # Dev/QC → classify + pre-analyze memory trong 1 LLM call
     bot = get_bot()
     await bot.send_message(chat_id, "⌛ Đang phân tích...")
 
     history = list(_chat_history.get(chat_id, []))
+    mem_ctx, dkb = await asyncio.gather(
+        _fetch_memory_context(chat_id),
+        _fetch_dynamic_kb(chat_id),
+    )
     try:
-        result = await _classify_and_synthesize(text, history)
+        result = await _classify_and_synthesize(text, history, memory_context=mem_ctx, dynamic_kb=dkb)
     except Exception as exc:
         error_log.append({"error": f"{type(exc).__name__}: {exc}", "source": "classify_and_synthesize"})
         logger.error(f"classify_and_synthesize error: {exc}")
@@ -275,22 +296,26 @@ async def _route_message(chat_id: str, text: str, name: str):
             await bot.send_message(chat_id, "⚠️ Không có câu trả lời.")
         return
 
-    # Action chưa rõ và conv chưa done → followup cho conv hiện tại
+    # Action chưa rõ và conv chưa done → followup cho conv hiện tại, truyền LLM result
     if conv.get("status") != "completed":
-        await _handle_conversation_reply(chat_id, text, name)
+        await _handle_conversation_reply(
+            chat_id, text, name,
+            task_description=result.get("task_description"),
+            task_kind=result.get("task_kind"),
+        )
         return
 
-    # Conv đã xong → xác định new task hay followup
-    try:
-        chat_type = await _classify_chat(chat_id, text, conv.get("service"))
-    except Exception as exc:
-        error_log.append({"error": f"{type(exc).__name__}: {exc}", "source": "classify_chat"})
-        logger.error(f"classify_chat error: {exc}")
-        chat_type = "followup"
+    # Conv đã xong → LLM tự quyết new_task hay followup dựa trên context field
+    is_followup = result.get("context") == "followup"
+    logger.info(f"context chat_id={chat_id} → {'followup' if is_followup else 'new_task'} text={text[:60]!r}")
 
-    logger.info(f"classify chat_id={chat_id} → {chat_type} text={text[:60]!r}")
-
-    if chat_type == "new_task":
+    if is_followup:
+        await _handle_conversation_reply(
+            chat_id, text, name,
+            task_description=result.get("task_description"),
+            task_kind=result.get("task_kind"),
+        )
+    else:
         del _active_conv[chat_id]
         if rtype == "action":
             await _start_new_task(
@@ -300,10 +325,23 @@ async def _route_message(chat_id: str, text: str, name: str):
                 task_description=result.get("task_description"),
             )
         else:
-            # clarify / unknown → classify_and_respond xử lý (hỏi user)
             await _classify_and_respond(chat_id, text, name)
-    else:
-        await _handle_conversation_reply(chat_id, text, name)
+
+
+async def _fetch_memory_context(chat_id: str) -> str | None:
+    """Lấy memory events và format thành chuỗi để pass vào LLM prompt."""
+    try:
+        from manager.services.memory_save import get_memory_service
+        svc = get_memory_service()
+        if not svc:
+            return None
+        events = await svc.get_all_recent_events(actor_id=chat_id, limit=20)
+        if not events:
+            return None
+        lines = [f"[{e.get('role','?')}] {e.get('message','')[:500]}" for e in events[-15:]]
+        return "\n".join(lines)
+    except Exception:
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -419,17 +457,9 @@ async def _start_new_task(
     task_kind: str = "k8s", service: str | None = None,
     task_description: str | None = None,
 ):
-    """Tạo job mới — nhưng trước hết phân tích memory xem có thể trả lời không cần SRE."""
+    """Tạo job mới và gửi SRE. Memory đã được pre-analyze trong _classify_and_synthesize."""
     if service is None or service == "unknown":
         service = _detect_service(text)
-
-    # ── Pre-analysis: read memory → try to answer before escalating ──
-    pre_result = await _pre_analyze_with_memory(chat_id, text, service)
-    if pre_result:
-        # AI answered without SRE — done
-        await _send_long_message(chat_id, _md_to_html(pre_result))
-        _add_to_history(chat_id, pre_result, role="assistant")
-        return
 
     # ── Need SRE — escalate ──
     job_id = str(uuid.uuid4())
@@ -444,7 +474,19 @@ async def _start_new_task(
             "sre_chat_id": None,
             "status": "active",
         }
-        await get_bot().send_message(chat_id, "🔍 Đang tìm SRE...")
+        # Tóm tắt objective từ task_description để user biết FirstMate đã hiểu đúng
+        if task_description:
+            obj_line = next(
+                (l.replace("**Objective**:", "").replace("**Objective**：", "").strip()
+                 for l in task_description.splitlines()
+                 if "Objective" in l),
+                None,
+            )
+        else:
+            obj_line = None
+        ack = f"✅ OK, tôi sẽ giúp bạn: *{obj_line}*" if obj_line else f"✅ OK, tôi đã hiểu yêu cầu về `{service}`"
+        ack += "\n\nĐang liên hệ SRE, vui lòng chờ..."
+        await get_bot().send_message(chat_id, ack, parse_mode="Markdown")
         asyncio.create_task(
             _debug_forward_to_sre(job_id, text, chat_id, requester_name, service, task_kind=task_kind, synthesized_prompt=task_description)
         )
@@ -467,7 +509,11 @@ async def _start_new_task(
 # CONVERSATION REPLY — phân tích free text của SRE / Dev/QC
 # ══════════════════════════════════════════════════════════════════
 
-async def _handle_conversation_reply(chat_id: str, text: str, name: str):
+async def _handle_conversation_reply(
+    chat_id: str, text: str, name: str,
+    task_description: str | None = None,
+    task_kind: str | None = None,
+):
     conv = _active_conv.get(chat_id)
     if not conv:
         return
@@ -478,25 +524,53 @@ async def _handle_conversation_reply(chat_id: str, text: str, name: str):
         sre_chat = conv.get("sre_chat_id")
         service = conv.get("service", "unknown")
         if sre_chat:
-            # Tạo job ID cho follow-up — SRE có thể click "Nhận task" để mở terminal mới
             orig_job = _debug_jobs.get(conv["job_id"], {})
             follow_job_id = str(uuid.uuid4())
-            # Re-classify task_kind từ text mới (user có thể đổi loại task),
-            # fallback về task_kind của job gốc nếu text không rõ ràng
-            follow_kind = _quick_classify(text) or orig_job.get("task_kind", "k8s")
+            prev_summary = orig_job.get("claude_summary", "")
+
+            # Dùng task_description từ LLM đã gọi trước (trong _route_message)
+            # Nếu không có (gọi trực tiếp), fallback gọi LLM lần này
+            if not task_description:
+                synth_history = list(_chat_history.get(chat_id, []))
+                if prev_summary:
+                    synth_history = [f"[Kết quả điều tra trước]\n{prev_summary}"] + synth_history
+                synth_result = await _classify_and_synthesize(
+                    text, synth_history, detected_service=service
+                )
+                task_description = synth_result.get("task_description") or text
+                task_kind = synth_result.get("task_kind")
+
+            task_desc = task_description or text
+            follow_kind = task_kind or _quick_classify(text) or orig_job.get("task_kind", "k8s")
             if follow_kind == "knowledge":
                 follow_kind = orig_job.get("task_kind", "k8s")
+
             _debug_jobs[follow_job_id] = {
                 "requester_chat_id": chat_id,
                 "requester_name": name,
                 "service": service,
                 "text": text,
+                "synthesized_prompt": task_desc,
                 "task_kind": follow_kind,
                 "sre_id": orig_job.get("sre_id", ""),
                 "sre_chat_id": sre_chat,
-                # Truyền kết quả điều tra trước để Claude không cần scan lại
-                "prev_summary": orig_job.get("claude_summary"),
+                "prev_summary": prev_summary,
             }
+
+            # Ack với objective từ synthesized prompt
+            obj_line = next(
+                (l.replace("**Objective**:", "").replace("**Objective**：", "").strip()
+                 for l in task_desc.splitlines() if "Objective" in l),
+                None,
+            )
+            svc_hint = f" trên `{service}`" if service and service != "unknown" else ""
+            ack_body = f"*{obj_line}*" if obj_line else f"*{text}*{svc_hint}"
+            await bot.send_message(
+                chat_id,
+                f"✅ OK, tôi sẽ giúp bạn: {ack_body}\n\nĐang liên hệ SRE, vui lòng chờ...",
+                parse_mode="Markdown",
+            )
+
             keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton("✅ Nhận task",  callback_data=f"dbg:accepted:{follow_job_id}"),
                 InlineKeyboardButton("🔄 Bận",        callback_data=f"dbg:busy:{follow_job_id}"),
@@ -508,7 +582,6 @@ async def _handle_conversation_reply(chat_id: str, text: str, name: str):
                 reply_markup=keyboard,
                 parse_mode="Markdown",
             )
-            await bot.send_message(chat_id, "📤 Đã gửi cho SRE. Chờ xác nhận...")
         else:
             # SRE chưa accept → re-forward job gốc kèm message mới
             orig_job = _debug_jobs.get(conv["job_id"], {})
@@ -563,10 +636,11 @@ async def _handle_conversation_reply(chat_id: str, text: str, name: str):
                 await bot.send_message(
                     requester,
                     f"✅ *SRE {name} báo hoàn thành*\n\n{summary}\n\n"
-                    f"_Có yêu cầu tiếp theo? Nhắn thẳng vào đây hoặc dùng /follow <action>._",
+                    f"_Có yêu cầu tiếp theo? Nhắn thẳng vào đây._",
                     parse_mode="Markdown",
                 )
                 _add_to_history(requester, complete_msg, role="assistant")
+                asyncio.ensure_future(_trigger_consolidation(requester))
             await bot.send_message(chat_id, "✅ Task hoàn thành. Conv đã đóng.")
             # Đánh dấu dev/qc conv completed (giữ để hỏi lại nếu follow-up thiếu context)
             if requester and requester in _active_conv:
@@ -748,8 +822,21 @@ async def _handle_callback(query: CallbackQuery):
                     prev_summary=job_meta.get("prev_summary"),
                     synthesized_prompt=job_meta.get("synthesized_prompt"),
                 )
-                await get_queue(job_meta["sre_id"]).put(job)
-                logger.info(f"[DEBUG] job={job_id[:8]} accepted by {sre_name}, queued runner")
+                from manager.services.runner_registry import (
+                    get_online_runner_for_sre, get_all_online, is_online,
+                )
+                sre_key = job_meta["sre_id"]
+                # Thử theo config key → email → any online runner
+                if is_online(sre_key):
+                    target_runner = sre_key
+                else:
+                    runner_ids = get_online_runner_for_sre(sre_key)
+                    if not runner_ids:
+                        online = get_all_online()
+                        runner_ids = [r.runner_id for r in online]
+                    target_runner = runner_ids[0] if runner_ids else sre_key
+                await get_queue(target_runner).put(job)
+                logger.info(f"[DEBUG] job={job_id[:8]} accepted by {sre_name}, queued to runner={target_runner}")
 
                 # Lưu sre_chat_id vào _debug_jobs để dùng fallback khi _active_conv bị clear
                 job_meta["sre_chat_id"] = sre_chat_id
@@ -817,7 +904,7 @@ async def _handle_callback(query: CallbackQuery):
                 if requester:
                     html_summary = _md_to_html(summary)
                     header = "✅ <b>Kết quả điều tra từ FirstMate</b>\n\n"
-                    footer = "\n\nCó yêu cầu tiếp theo? Nhắn thẳng vào đây hoặc dùng /follow &lt;action&gt;."
+                    footer = "\n\nCó yêu cầu tiếp theo? Nhắn thẳng vào đây."
                     full = header + html_summary + footer
                     if len(full) <= 4000:
                         await get_bot().send_message(requester, full, parse_mode="HTML")
@@ -825,11 +912,12 @@ async def _handle_callback(query: CallbackQuery):
                         await _send_long_message(requester, header + html_summary)
                         await get_bot().send_message(
                             requester,
-                            "Có yêu cầu tiếp theo? Nhắn thẳng vào đây hoặc dùng /follow &lt;action&gt;.",
+                            "Có yêu cầu tiếp theo? Nhắn thẳng vào đây.",
                             parse_mode="HTML",
                         )
-                    # Save result to AgentBase Memory
+                    # Save result to AgentBase Memory + trigger consolidation
                     _add_to_history(requester, summary, role="assistant")
+                    asyncio.ensure_future(_trigger_consolidation(requester))
                     # Đánh dấu dev/qc conv completed
                     if requester in _active_conv:
                         _active_conv[requester]["status"] = "completed"
@@ -985,6 +1073,8 @@ new_task ví dụ: "payment service đang lỗi 500" (khi đang nói về servic
 
 Trả về JSON: {"type": "followup"} hoặc {"type": "new_task"}"""
 
+    logger.info(f"classify_chat INPUT text={text[:80]!r} service={service!r} history_len={len(history)}")
+
     response = await llm.ainvoke([
         SystemMessage(content=system),
         HumanMessage(content=(
@@ -999,7 +1089,9 @@ Trả về JSON: {"type": "followup"} hoặc {"type": "new_task"}"""
         if raw.startswith("json"):
             raw = raw[4:]
     try:
-        return json.loads(raw).get("type", "new_task")
+        result_type = json.loads(raw).get("type", "new_task")
+        logger.info(f"classify_chat OUTPUT type={result_type!r}")
+        return result_type
     except Exception:
         logger.warning(f"classify_chat parse failed: {raw!r}")
         return "followup"  # safe default: treat unknown as follow-up
@@ -1062,13 +1154,15 @@ async def _classify_and_synthesize(
     text: str,
     history: list | None = None,
     detected_service: str | None = None,
+    memory_context: str | None = None,
+    dynamic_kb: dict | None = None,
 ) -> dict:
-    """1 LLM call: classify + synthesize task description (replaces classify_and_answer + enrich_action + synthesize_task).
+    """1 LLM call: classify + pre-analyze memory + synthesize task description.
 
     Returns one of:
-        {"type": "knowledge", "answer": "<markdown>"}
-        {"type": "action", "service": "svc", "task_kind": "k8s"|"gateway_log", "task_description": "..."}
-        {"type": "clarify", "service": "svc|null", "inferred": "...", "question": "..."}
+        {"type": "knowledge", "answer": "<markdown>"}   ← answered from knowledge or memory
+        {"type": "action", "context": "new_task"|"followup", "service": "svc", "task_kind": "k8s"|"gateway_log", "task_description": "..."}
+        {"type": "clarify", "context": "new_task"|"followup", "service": "svc|null", "inferred": "...", "question": "..."}
     """
     from langchain_openai import ChatOpenAI
     from langchain_core.messages import SystemMessage, HumanMessage
@@ -1080,7 +1174,7 @@ async def _classify_and_synthesize(
         api_key=os.environ["GREENNODE_API_KEY"],
         temperature=0,
         max_tokens=8192,
-        timeout=90 if os.environ.get("DEBUG") else 30,
+        timeout=90 if os.environ.get("DEBUG") else 60,
         max_retries=0,
     )
 
@@ -1091,56 +1185,105 @@ async def _classify_and_synthesize(
         history_text = "\n".join(f"• {m}" for m in history[-10:])
         history_section = f"\n=== LỊCH SỬ TRÒ CHUYỆN ===\n{history_text}\n"
 
+    memory_section = ""
+    if memory_context:
+        memory_section = f"\n=== MEMORY (kết quả check trước đó) ===\n{memory_context}\n"
+
+    dynamic_kb_section = ""
+    if dynamic_kb:
+        import json as _json
+        svc_map = dynamic_kb.get("service_namespace_map", {})
+        issues = dynamic_kb.get("known_issues", [])
+        notes = dynamic_kb.get("environment_notes", "")
+        active = dynamic_kb.get("active_services", [])
+        parts = []
+        if svc_map:
+            parts.append("Service → Namespace:\n" + "\n".join(f"  {s} → {n}" for s, n in svc_map.items()))
+        if active:
+            parts.append("Services đang active: " + ", ".join(active))
+        if issues:
+            parts.append("Known issues:\n" + "\n".join(f"  • {i}" for i in issues[:5]))
+        if notes:
+            parts.append(f"Environment: {notes}")
+        if parts:
+            dynamic_kb_section = "\n=== DYNAMIC KB (tổng hợp từ memory) ===\n" + "\n".join(parts) + "\n"
+
     service_hint = ""
     if detected_service and detected_service != "unknown":
         service_hint = f'\nService đã biết từ context trước: "{detected_service}" — ưu tiên dùng nếu message thiếu service.\n'
 
     system = f"""/no_think
 Bạn là FirstMate — AI assistant DevOps/SRE. Nhận tin nhắn từ developer/QC, phân tích và trả về JSON.
-{history_section}{service_hint}
+{history_section}{memory_section}{dynamic_kb_section}{service_hint}
 === KNOWLEDGE BASE ===
 {kb}
 
 === OUTPUT FORMAT (JSON thuần, không markdown block) ===
 
-Câu hỏi kiến thức (không cần kubectl/SSH vào live system):
+Trả lời được từ knowledge hoặc memory:
 {{"type": "knowledge", "answer": "<markdown tiếng Việt>"}}
 
 Action rõ ràng (có service):
-{{"type": "action", "service": "kebab-case-name", "task_kind": "k8s" hoặc "gateway_log", "task_description": "**Objective**: ...\\n**Service**: ...\\n**Namespace**: ...\\n**Scope**: ...\\n**Output**: ..."}}
+{{"type": "action", "context": "new_task"|"followup", "service": "kebab-case-name", "task_kind": "k8s" hoặc "gateway_log", "task_description": "**Objective**: ...\\n**Service**: ...\\n**Namespace**: ...\\n**Scope**: ...\\n**Output**: ..."}}
 
 Action thiếu context (không biết service):
-{{"type": "clarify", "service": null, "task_kind": "k8s", "inferred": "mô tả đầy đủ nhất có thể", "question": "Câu hỏi ngắn gọn"}}
+{{"type": "clarify", "context": "new_task"|"followup", "service": null, "task_kind": "k8s", "inferred": "mô tả đầy đủ nhất có thể", "question": "Câu hỏi ngắn gọn"}}
 
-=== PHÂN LOẠI ===
-- knowledge: câu hỏi có thể trả lời không cần live system (định nghĩa, tính toán mạng, kiến thức tĩnh)
-  VD: "statefulset là gì", "subnet /28 có bao nhiêu host", "IP 172.16.0.1 là public hay private"
+=== PHÂN LOẠI type ===
+- knowledge: dùng khi CÓ THỂ trả lời mà KHÔNG cần truy cập live system:
+  1. Câu hỏi kiến thức tĩnh (định nghĩa, tính toán mạng)
+  2. Thông tin ĐÃ CÓ trong MEMORY hoặc lịch sử trò chuyện (kết quả check trước, trạng thái pod đã biết)
+  VD: "statefulset là gì", "subnet /28 có bao nhiêu host"
+  VD (từ memory): "số pod loyalty bao nhiêu?" nếu MEMORY đã có kết quả check gần đây
 - gateway_log: kiểm tra nginx gateway log (có domain 2+ dấu chấm, hoặc "log gateway")
 - k8s: kiểm tra/thay đổi pod/deployment/service Kubernetes
 
+=== PHÂN LOẠI context ===
+- "followup": message là phần tiếp theo của cuộc trò chuyện hiện tại trong lịch sử
+  → cùng service, cùng vấn đề, lệnh tiếp theo, dùng đại từ "nó/đó/namespace này/deployment đó"
+  VD: "scale lên 12", "restart lại đi", "kiểm tra lại", "có bao nhiêu pod trong namespace này"
+- "new_task": yêu cầu hoàn toàn mới, khác service hoặc không liên quan đến lịch sử
+  VD: "check pod payment-service" (khi đang nói về loyalty), "kiểm tra log zalopay.vn"
+
 === RULES ===
-- service LUÔN kebab-case (vd: loyalty-tier-core, payment-service)
-- Nếu có lịch sử + action thiếu service → suy luận service từ lịch sử → type="action"
-- Nếu không suy luận được service → type="clarify"
+- service LUÔN phải có giá trị, KHÔNG được null với type="action":
+  • Có service cụ thể → dùng tên service (kebab-case)
+  • Query namespace-level (không có service cụ thể) → dùng namespace làm service (vd: "zpp-loyalty-qc")
+  • Không biết → suy luận từ lịch sử, không để null
+- LUÔN đọc lịch sử trò chuyện để bổ sung context thiếu
+- Nếu message hiện tại thiếu service → tìm trong lịch sử gần nhất → type="action" với service suy luận được
+- Nếu lịch sử có đề cập service (dù không hoàn toàn khớp) → suy luận và dùng → KHÔNG hỏi lại
+- Chỉ type="clarify" khi cả message lẫn lịch sử đều không có đủ thông tin để suy luận service
 - task_description: ngắn gọn, đủ để agent thực thi không hỏi thêm
 
 === VÍ DỤ ===
 Lịch sử: ["check pod loyalty-tier-core", "4/4 Running"]
 Yêu cầu: "scale lên 12 pod"
-→ {{"type": "action", "service": "loyalty-tier-core", "task_kind": "k8s", "task_description": "**Objective**: Scale loyalty-tier-core lên 12 pod\\n**Service**: loyalty-tier-core\\n**Scope**: kubectl scale deployment — KHÔNG đụng vào service khác\\n**Output**: Số pod sau khi scale, trạng thái rolling update"}}
+→ {{"type": "action", "context": "followup", "service": "loyalty-tier-core", "task_kind": "k8s", "task_description": "**Objective**: Scale loyalty-tier-core lên 12 pod\\n**Service**: loyalty-tier-core\\n**Scope**: kubectl scale deployment — KHÔNG đụng vào service khác\\n**Output**: Số pod sau khi scale, trạng thái rolling update"}}
+
+Lịch sử: ["check pod loyalty-tier-core", "4/4 Running"]
+Yêu cầu: "check pod payment service"
+→ {{"type": "action", "context": "new_task", "service": "payment-service", "task_kind": "k8s", "task_description": "**Objective**: Kiểm tra số pod của payment-service\\n**Service**: payment-service\\n**Scope**: kubectl get pods + deployment status\\n**Output**: Số pod running/total, trạng thái từng pod"}}
 
 Yêu cầu: "check số pod của loyalty tier core" (không có lịch sử)
-→ {{"type": "action", "service": "loyalty-tier-core", "task_kind": "k8s", "task_description": "**Objective**: Kiểm tra số pod của loyalty-tier-core\\n**Service**: loyalty-tier-core\\n**Scope**: kubectl get pods + deployment status — KHÔNG cần logs hay events\\n**Output**: Số pod running/total, trạng thái từng pod"}}
+→ {{"type": "action", "context": "new_task", "service": "loyalty-tier-core", "task_kind": "k8s", "task_description": "**Objective**: Kiểm tra số pod của loyalty-tier-core\\n**Service**: loyalty-tier-core\\n**Scope**: kubectl get pods + deployment status — KHÔNG cần logs hay events\\n**Output**: Số pod running/total, trạng thái từng pod"}}
 
 Yêu cầu: "scale lên 12 pod" (không có lịch sử, không có service hint)
-→ {{"type": "clarify", "service": null, "task_kind": "k8s", "inferred": "scale [?] lên 12 pod", "question": "Bạn muốn scale service nào lên 12 pod?"}}
+→ {{"type": "clarify", "context": "new_task", "service": null, "task_kind": "k8s", "inferred": "scale [?] lên 12 pod", "question": "Bạn muốn scale service nào lên 12 pod?"}}
 
 Yêu cầu: "check log dev.zalopay.vn"
-→ {{"type": "action", "service": "dev.zalopay.vn", "task_kind": "gateway_log", "task_description": "**Objective**: Kiểm tra log nginx gateway cho dev.zalopay.vn\\n**Service**: dev.zalopay.vn\\n**Scope**: query gateway log — KHÔNG cần kubectl\\n**Output**: Recent errors, status codes bất thường"}}
+→ {{"type": "action", "context": "new_task", "service": "dev.zalopay.vn", "task_kind": "gateway_log", "task_description": "**Objective**: Kiểm tra log nginx gateway cho dev.zalopay.vn\\n**Service**: dev.zalopay.vn\\n**Scope**: query gateway log — KHÔNG cần kubectl\\n**Output**: Recent errors, status codes bất thường"}}
 
 Yêu cầu: "statefulset là gì"
 → {{"type": "knowledge", "answer": "..."}}
 """
+
+    logger.info(
+        f"classify_synthesize INPUT text={text[:80]!r} "
+        f"detected_service={detected_service!r} "
+        f"history_len={len(history)} "
+        f"service_hint={'yes' if service_hint else 'no'}"
+    )
 
     response = await llm.ainvoke([
         SystemMessage(content=system),
@@ -1154,7 +1297,12 @@ Yêu cầu: "statefulset là gì"
 
     try:
         result = json.loads(raw)
-        logger.info(f"classify_synthesize type={result.get('type')} service={result.get('service')} text={text[:50]!r}")
+        logger.info(
+            f"classify_synthesize OUTPUT type={result.get('type')} "
+            f"service={result.get('service')} "
+            f"task_kind={result.get('task_kind')} "
+            f"task_description={str(result.get('task_description',''))!r}"
+        )
         return result
     except Exception:
         logger.warning(f"classify_synthesize parse failed: {raw[:200]!r}")
@@ -1166,13 +1314,17 @@ async def _classify_and_respond(
     detected_service: str | None = None,
     force_action: bool = False,
 ):
-    """Unified entry: 1 LLM call để classify + synthesize, rồi xử lý kết quả."""
+    """Unified entry: 1 LLM call để classify + synthesize + pre-analyze memory."""
     bot = get_bot()
     await bot.send_message(chat_id, "⌛ Đang phân tích...")
 
     history = list(_chat_history.get(chat_id, []))
+    mem_ctx, dkb = await asyncio.gather(
+        _fetch_memory_context(chat_id),
+        _fetch_dynamic_kb(chat_id),
+    )
     try:
-        result = await _classify_and_synthesize(text, history, detected_service=detected_service)
+        result = await _classify_and_synthesize(text, history, detected_service=detected_service, memory_context=mem_ctx, dynamic_kb=dkb)
     except Exception as exc:
         error_log.append({"error": f"{type(exc).__name__}: {exc}", "source": "classify_and_synthesize"})
         logger.error(f"classify_and_synthesize error: {exc}")
@@ -1191,12 +1343,38 @@ async def _classify_and_respond(
         else:
             await bot.send_message(chat_id, "⚠️ Không có câu trả lời.")
     elif rtype == "action":
-        await _start_new_task(
-            chat_id, text, requester_name,
-            task_kind=result.get("task_kind", "k8s"),
-            service=result.get("service") or detected_service,
-            task_description=result.get("task_description"),
-        )
+        svc = result.get("service") or detected_service
+        task_desc = result.get("task_description")
+        if not svc or svc == "unknown":
+            svc = _detect_service(text)
+        # Fallback: extract namespace từ task_description (namespace-level queries)
+        if (not svc or svc == "unknown") and task_desc:
+            for line in task_desc.splitlines():
+                if "**Namespace**" in line and ":" in line:
+                    ns = line.split(":", 1)[-1].strip().split()[0]
+                    if ns and ns != "N/A":
+                        svc = ns
+                        break
+        if not svc or svc == "unknown":
+            _active_conv[chat_id] = {
+                "role": "pending_confirm",
+                "confirmed_text": text,
+                "original_text": text,
+                "task_kind": result.get("task_kind", "k8s"),
+                "service": None,
+            }
+            await bot.send_message(
+                chat_id,
+                "Bạn muốn thực hiện yêu cầu này trên service nào?",
+                parse_mode="Markdown",
+            )
+        else:
+            await _start_new_task(
+                chat_id, text, requester_name,
+                task_kind=result.get("task_kind", "k8s"),
+                service=svc,
+                task_description=task_desc,
+            )
     elif rtype == "clarify":
         service = result.get("service") or detected_service
         _active_conv[chat_id] = {
@@ -1209,7 +1387,7 @@ async def _classify_and_respond(
         question = result.get("question") or f'Có phải bạn muốn "{result.get("inferred", text)}" không?'
         await bot.send_message(
             chat_id,
-            f"{question}\n\n💡 _Dùng `/follow <action>` để Firstmate tự đọc context._",
+                question,
             parse_mode="Markdown",
         )
     else:
@@ -1221,8 +1399,22 @@ async def _classify_and_respond(
 # ══════════════════════════════════════════════════════════════════
 
 _YES_WORDS = {"ok", "yes", "đúng", "đúng rồi", "phải", "ừ", "đồng ý", "đúng vậy",
-              "y", "yeah", "yep", "oke", "okie", "có", "vâng", "ừa", "ok rồi", "đúng đó"}
-_NO_WORDS  = {"không", "no", "sai", "hủy", "cancel", "không phải", "nhầm", "ko", "k"}
+              "yeah", "yep", "oke", "okie", "có", "vâng", "ừa", "ok rồi", "đúng đó"}
+_NO_WORDS  = {"không", "no", "sai", "hủy", "cancel", "không phải", "nhầm", "ko"}
+
+
+def _matches_words(text: str, word_set: set[str]) -> bool:
+    """Check if text exactly equals or contains a phrase/word from word_set as whole words."""
+    t = text.lower().strip()
+    if t in word_set:
+        return True
+    # Multi-word phrases: check substring
+    for w in word_set:
+        if " " in w and w in t:
+            return True
+    # Single words: check word-boundary (split on whitespace/punctuation)
+    text_words = set(re.split(r"[\s,!.?]+", t))
+    return bool(text_words & {w for w in word_set if " " not in w})
 
 
 async def _ask_task_kind(chat_id: str, text: str, name: str):
@@ -1265,7 +1457,7 @@ async def _handle_pending_confirm(chat_id: str, text: str, name: str, conv: dict
     bot = get_bot()
     text_lower = text.lower().strip()
 
-    if text_lower in _YES_WORDS or any(w in text_lower for w in _YES_WORDS):
+    if _matches_words(text_lower, _YES_WORDS):
         # Xác nhận → forward với action đầy đủ
         confirmed = conv["confirmed_text"]
         task_kind = conv.get("task_kind", "k8s")
@@ -1273,15 +1465,18 @@ async def _handle_pending_confirm(chat_id: str, text: str, name: str, conv: dict
         del _active_conv[chat_id]
         await _start_new_task(chat_id, confirmed, name, task_kind=task_kind, service=conv_service)
 
-    elif text_lower in _NO_WORDS or any(w in text_lower for w in _NO_WORDS):
+    elif _matches_words(text_lower, _NO_WORDS):
         # Hủy
         del _active_conv[chat_id]
         await bot.send_message(chat_id, "Đã hủy. Vui lòng nhắn lại yêu cầu cụ thể hơn.")
 
     else:
-        # Dev/QC cung cấp thêm info / sửa lại → re-classify với text mới
+        # Dev/QC cung cấp thêm info → re-classify với original request + user's reply làm service hint
+        original_text = conv.get("confirmed_text", text)
+        prev_service = conv.get("service")
         del _active_conv[chat_id]
-        await _classify_and_respond(chat_id, text, name)
+        # Luôn qua LLM để phân tích đúng, dùng reply của user làm service hint
+        await _classify_and_respond(chat_id, original_text, name, detected_service=text)
 
 
 async def _enrich_action(text: str, history: list) -> dict:

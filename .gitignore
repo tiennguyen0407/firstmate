@@ -1,9 +1,17 @@
 # Secrets & credentials
 .env
+.env.local
+.env.memory
+.env.production
 runner/.env
+runner/.env.local
 .greennode.json
 .agentbase/
 deploy.config
+
+# Editor swap files
+*.swp
+*.swo
 
 # Sensitive config (chứa Telegram IDs, internal hosts, IPs nội bộ)
 manager/config/services.yaml
