@@ -1086,6 +1086,7 @@ async def _maybe_clarify_action(chat_id: str, text: str, name: str, task_kind: s
     """
     service = detected_service if detected_service and detected_service != "unknown" else _detect_service(text)
     history = list(_chat_history.get(chat_id, []))
+    logger.info(f"clarify chat={chat_id} service={service} history_len={len(history)} follow={from_follow} text={text[:50]!r}")
 
     # Đủ context (service rõ ràng) hoặc không có history → forward trực tiếp
     if service != "unknown" or not history:
@@ -1095,6 +1096,7 @@ async def _maybe_clarify_action(chat_id: str, text: str, name: str, task_kind: s
     # Service vague + có history → đọc context để suy luận
     try:
         result = await _enrich_action(text, history)
+        logger.info(f"enrich_action result={result} text={text[:50]!r}")
     except Exception as exc:
         error_log.append({"error": f"{type(exc).__name__}: {exc}", "source": "_enrich_action"})
         logger.error(f"enrich_action error: {exc}")
@@ -1102,6 +1104,7 @@ async def _maybe_clarify_action(chat_id: str, text: str, name: str, task_kind: s
         return
 
     enriched_service = result.get("service") or service
+    logger.info(f"enriched_service={enriched_service} from_follow={from_follow}")
 
     if from_follow:
         # /follow → tin tưởng LLM, cho phép auto-proceed
