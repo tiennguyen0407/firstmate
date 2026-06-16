@@ -112,7 +112,7 @@ if known_issues:
 
 # ── Main ──────────────────────────────────────────────────────────
 
-MODE="${1:-743616350}"
+MODE="${1:?Usage: bash check_memory.sh <actor_id|all>}"
 
 echo "════════════════════════════════════════════════"
 echo "  FirstMate Memory Status"
