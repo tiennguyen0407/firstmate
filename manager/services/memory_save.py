@@ -115,6 +115,47 @@ class MemorySaveService:
             return _rejected(f"save_failed: {exc}")
 
 
+    # ── Retrieve recent events (for pre-analysis) ─────────────────
+
+    async def get_recent_events(
+        self, actor_id: str, session_id: str = "", limit: int = 20,
+    ) -> list[dict]:
+        """Fetch recent short-term events for an actor/session."""
+        if not session_id:
+            session_id = f"chat-{actor_id}"
+        try:
+            result = await self._get_client().list_events_async(
+                id=self._memory_id,
+                actorId=actor_id,
+                sessionId=session_id,
+                page=1,
+                size=limit,
+            )
+            events = []
+            for e in getattr(result, "list_data", []):
+                payload = getattr(e, "payload", None)
+                if payload:
+                    events.append({
+                        "role": getattr(payload, "role", "?"),
+                        "message": getattr(payload, "message", ""),
+                    })
+            # API returns newest-first, reverse to chronological
+            events.reverse()
+            logger.info(f"[Memory] fetched {len(events)} events actor={actor_id} session={session_id[:12]}")
+            return events
+        except Exception as exc:
+            logger.warning(f"[Memory] get_recent_events failed: {exc}")
+            return []
+
+    async def get_all_recent_events(self, actor_id: str, limit: int = 30) -> list[dict]:
+        """Fetch events across all sessions for an actor (uses chat-{id} + recent job sessions)."""
+        all_events = []
+        # Primary: the default chat session
+        events = await self.get_recent_events(actor_id, f"chat-{actor_id}", limit=limit)
+        all_events.extend(events)
+        return all_events
+
+
 # ── Helpers ──────────────────────────────────────────────────────
 
 def _rejected(reason: str) -> dict:

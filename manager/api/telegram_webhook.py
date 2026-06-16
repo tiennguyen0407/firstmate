@@ -59,10 +59,17 @@ _chat_history: dict[str, deque] = {}
 _MAX_HISTORY = 20
 
 
+_last_saved: dict[str, str] = {}  # chat_id → last content hash (dedup)
+
 def _add_to_history(chat_id: str, content: str, role: str = "user") -> None:
     if chat_id not in _chat_history:
         _chat_history[chat_id] = deque(maxlen=_MAX_HISTORY)
     _chat_history[chat_id].append(content)
+    # Dedup: skip if same chat_id + role + content just saved
+    dedup_key = f"{chat_id}:{role}:{content[:100]}"
+    if _last_saved.get(chat_id) == dedup_key:
+        return
+    _last_saved[chat_id] = dedup_key
     # Save event to AgentBase Memory (non-blocking)
     conv = _active_conv.get(chat_id, {})
     session_id = conv.get("job_id", f"chat-{chat_id}")
@@ -306,10 +313,128 @@ async def _route_message(chat_id: str, text: str, name: str):
         await _handle_conversation_reply(chat_id, text, name)
 
 
+# ══════════════════════════════════════════════════════════════════
+# PRE-ANALYSIS — read memory before escalating to SRE
+# ══════════════════════════════════════════════════════════════════
+
+async def _pre_analyze_with_memory(chat_id: str, text: str, service: str) -> str | None:
+    """Read short-term memory and try to answer without SRE.
+
+    Returns an answer string if AI can handle it, or None if SRE escalation needed.
+    """
+    try:
+        from manager.services.memory_save import get_memory_service
+        svc = get_memory_service()
+
+        # Gather context: local history + memory events
+        local_history = list(_chat_history.get(chat_id, []))
+        memory_events = []
+        if svc:
+            memory_events = await svc.get_all_recent_events(actor_id=chat_id, limit=20)
+
+        # Build context string from memory
+        memory_context = ""
+        if memory_events:
+            lines = []
+            for evt in memory_events[-15:]:  # last 15 events
+                role = evt.get("role", "?")
+                msg = evt.get("message", "")[:500]
+                lines.append(f"[{role}] {msg}")
+            memory_context = "\n".join(lines)
+
+        # If no memory context and no local history, can't pre-analyze
+        if not memory_context and not local_history:
+            return None
+
+        from langchain_openai import ChatOpenAI
+        from langchain_core.messages import SystemMessage, HumanMessage
+        from manager.services.kb_loader import format_for_prompt as kb_prompt
+
+        llm = ChatOpenAI(
+            model="qwen/qwen3-5-27b",
+            base_url="https://maas-llm-aiplatform-hcm.api.vngcloud.vn/v1",
+            api_key=os.environ["GREENNODE_API_KEY"],
+            temperature=0,
+            max_tokens=2048,
+            timeout=15,
+            max_retries=0,
+        )
+
+        kb = kb_prompt() or ""
+        system = (
+            "/no_think\n"
+            "Bạn là FirstMate — AI assistant DevOps/SRE.\n\n"
+            "NHIỆM VỤ: Phân tích yêu cầu của user dựa trên context có sẵn. "
+            "Trả lời user TRƯỚC nếu có thể, CHỈ escalate SRE khi thật sự cần.\n\n"
+            "BẠN CÓ THỂ TRẢ LỜI khi:\n"
+            "- Thông tin đã có trong memory/context (kết quả check trước đó)\n"
+            "- Câu hỏi về kiến thức DevOps/K8s chung\n"
+            "- So sánh, tổng hợp từ dữ liệu đã thu thập\n"
+            "- Giải thích lỗi/log đã có trong context\n\n"
+            "CHỈ ESCALATE SRE khi:\n"
+            "- Cần truy cập live system (kubectl, SSH, DB, Redis)\n"
+            "- Cần quyền admin/production\n"
+            "- Cần kiểm tra log/metric realtime\n"
+            "- Memory không đủ thông tin để kết luận\n"
+            "- Có nguy cơ incident, mất dữ liệu, bảo mật\n\n"
+            "TRẢ VỀ JSON:\n"
+            '- Tự trả lời: {"can_answer": true, "answer": "<Markdown tiếng Việt>"}\n'
+            '- Cần SRE: {"can_answer": false, "reason": "<lý do cụ thể cần SRE check gì>"}\n\n'
+            "Khi escalate, nói CỤ THỂ SRE cần check gì, ví dụ:\n"
+            '"Cần SRE check logs của pod loyalty-tier-core trong namespace production vì memory không có thông tin lỗi gần đây."\n\n'
+            "KHÔNG nói chung chung 'hãy hỏi SRE kiểm tra'.\n"
+        )
+        if kb:
+            system += f"\n--- Knowledge Base ---\n{kb}\n"
+
+        user_msg = f"Service: {service}\nYêu cầu: {text}\n"
+        if memory_context:
+            user_msg += f"\n--- Short-term memory (recent events) ---\n{memory_context}\n"
+        if local_history:
+            user_msg += f"\n--- Chat history ---\n" + "\n".join(local_history[-5:]) + "\n"
+
+        response = await llm.ainvoke([
+            SystemMessage(content=system),
+            HumanMessage(content=user_msg),
+        ])
+
+        raw = response.content.strip()
+        raw = _strip_think_tags(raw)
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
+
+        result = json.loads(raw)
+
+        if result.get("can_answer"):
+            answer = result.get("answer", "")
+            if answer and len(answer) >= 20:
+                logger.info(f"[PreAnalysis] answered from memory chat={chat_id} len={len(answer)}")
+                return answer
+
+        # Can't answer — log reason for debugging
+        reason = result.get("reason", "unknown")
+        logger.info(f"[PreAnalysis] escalate chat={chat_id} reason={reason[:100]}")
+        return None
+
+    except Exception as exc:
+        logger.warning(f"[PreAnalysis] failed, escalating: {exc}")
+        return None
+
+
 async def _start_new_task(chat_id: str, text: str, requester_name: str, task_kind: str = "k8s", service: str | None = None):
-    """Tạo job mới (đã thoát conv hoặc chưa có conv)."""
+    """Tạo job mới — nhưng trước hết phân tích memory xem có thể trả lời không cần SRE."""
     if service is None or service == "unknown":
         service = _detect_service(text)
+
+    # ── Pre-analysis: read memory → try to answer before escalating ──
+    pre_result = await _pre_analyze_with_memory(chat_id, text, service)
+    if pre_result:
+        # AI answered without SRE — done
+        await _send_long_message(chat_id, _md_to_html(pre_result))
+        _add_to_history(chat_id, pre_result, role="assistant")
+        return
+
+    # ── Need SRE — escalate ──
     job_id = str(uuid.uuid4())
 
     if DEBUG_MODE:
@@ -1390,12 +1515,7 @@ async def job_complete(payload: _ClaudeDonePayload):
         return {"ok": False, "error": "job not found"}
 
     job["claude_summary"] = payload.summary
-
-    # Save Claude investigation result to AgentBase Memory
-    requester = job.get("requester_chat_id", "")
-    if requester:
-        session_id = payload.job_id
-        _add_to_history(requester, payload.summary, role="assistant")
+    # Note: summary saved to memory later when SRE clicks verify:done (avoids duplicate)
 
     # Tìm SRE chat_id từ active conv
     sre_chat = next(
