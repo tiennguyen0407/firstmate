@@ -50,7 +50,9 @@ async def submit_result(job_id: str, result: TaskResult):
         raise HTTPException(status_code=404, detail="Job not found")
 
     # Resume LangGraph waiting_runner node
-    thread_config = {"configurable": {"thread_id": job_id}}
+    from manager.api.telegram_webhook import _debug_jobs
+    requester_id = (_debug_jobs.get(job_id) or {}).get("requester_chat_id", "unknown")
+    thread_config = {"configurable": {"thread_id": job_id, "actor_id": requester_id}}
     await asyncio.to_thread(
         graph.invoke,
         Command(resume=result.model_dump()),

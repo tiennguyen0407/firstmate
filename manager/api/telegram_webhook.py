@@ -23,6 +23,40 @@ router = APIRouter(prefix="/webhook", tags=["telegram"])
 # ── Config ────────────────────────────────────────────────────────
 DEBUG_MODE = os.getenv("DEBUG", "false").lower() == "true"
 
+# ── AgentBase Memory client (DEBUG mode) ─────────────────────────
+_MEMORY_ID = os.getenv("AGENTBASE_MEMORY_ID", "")
+_memory_client = None
+
+def _get_memory_client():
+    global _memory_client
+    if _memory_client is None and _MEMORY_ID:
+        try:
+            from greennode_agentbase.memory import MemoryClient
+            _memory_client = MemoryClient()
+            logger.info(f"[Memory] MemoryClient initialized, memory_id={_MEMORY_ID}")
+        except Exception as exc:
+            logger.warning(f"[Memory] Failed to init MemoryClient: {exc}")
+    return _memory_client
+
+async def _save_event(actor_id: str, session_id: str, role: str, content: str):
+    """Save a conversation event to AgentBase Memory (best-effort, non-blocking)."""
+    if not _MEMORY_ID:
+        return
+    try:
+        client = _get_memory_client()
+        if not client:
+            return
+        from greennode_agentbase.memory.models import EventCreateRequest, EventPayload
+        request = EventCreateRequest(
+            payload=EventPayload(type="conversational", role=role, message=content)
+        )
+        await client.create_event_async(
+            id=_MEMORY_ID, actorId=actor_id, sessionId=session_id, request=request
+        )
+        logger.info(f"[Memory] Saved event actor={actor_id} session={session_id[:8]} role={role} len={len(content)}")
+    except Exception as exc:
+        logger.error(f"[Memory] Failed to save event: {exc}")
+
 # ── Error log ────────────────────────────────────────────────────
 error_log: deque = deque(maxlen=100)
 
@@ -39,10 +73,14 @@ _chat_history: dict[str, deque] = {}
 _MAX_HISTORY = 20
 
 
-def _add_to_history(chat_id: str, content: str) -> None:
+def _add_to_history(chat_id: str, content: str, role: str = "user") -> None:
     if chat_id not in _chat_history:
         _chat_history[chat_id] = deque(maxlen=_MAX_HISTORY)
     _chat_history[chat_id].append(content)
+    # Save to AgentBase Memory (non-blocking)
+    conv = _active_conv.get(chat_id, {})
+    session_id = conv.get("job_id", f"chat-{chat_id}")
+    asyncio.ensure_future(_save_event(actor_id=chat_id, session_id=session_id, role=role, content=content))
 
 
 _bot: Bot | None = None
@@ -245,6 +283,7 @@ async def _route_message(chat_id: str, text: str, name: str):
             if not answer:
                 raise ValueError("LLM returned no answer for knowledge question")
             await _send_long_message(chat_id, _md_to_html(answer))
+            _add_to_history(chat_id, answer, role="assistant")
         except Exception as exc:
             err = f"{type(exc).__name__}: {str(exc)[:300]}"
             error_log.append({"error": err, "source": "answer_knowledge"})
@@ -309,7 +348,7 @@ async def _start_new_task(chat_id: str, text: str, requester_name: str, task_kin
             "assignment_attempts": [], "needs_lead_approval": False,
             "status": JobStatus.PENDING,
         }
-        thread_config = {"configurable": {"thread_id": job_id}}
+        thread_config = {"configurable": {"thread_id": job_id, "actor_id": chat_id}}
         asyncio.create_task(_run_graph(job_id, initial_state, thread_config, chat_id))
         await get_bot().send_message(chat_id, "🔍 Đang kiểm tra...")
 
@@ -658,6 +697,8 @@ async def _handle_callback(query: CallbackQuery):
                             "Có yêu cầu tiếp theo? Nhắn thẳng vào đây hoặc dùng /follow &lt;action&gt;.",
                             parse_mode="HTML",
                         )
+                    # Save result to AgentBase Memory
+                    _add_to_history(requester, summary, role="assistant")
                     # Đánh dấu dev/qc conv completed
                     if requester in _active_conv:
                         _active_conv[requester]["status"] = "completed"
@@ -691,7 +732,8 @@ async def _handle_callback(query: CallbackQuery):
 
         # ── Normal LangGraph mode ─────────────────────────────────
         elif kind in ("sre", "lead"):
-            thread_config = {"configurable": {"thread_id": job_id}}
+            requester_id = (_debug_jobs.get(job_id) or {}).get("requester_chat_id", "unknown")
+            thread_config = {"configurable": {"thread_id": job_id, "actor_id": requester_id}}
             result = await graph.ainvoke(Command(resume=action), thread_config)
             state = graph.get_state(thread_config)
             if state.next:
@@ -1183,13 +1225,28 @@ async def _debug_forward_to_sre(
         runners = cfg.get("runners", {})
         exclude = exclude or []
 
+        from manager.services.runner_registry import get_online_runner_for_sre
+
         sre_info: dict | None = None
-        # 1) Service-aware: owner first, then SREs with services_owned
+        # 1) Service-aware + online: owner first, then SREs with services_owned
         for candidate in get_sres_for_service(service, exclude=exclude):
-            if candidate.get("telegram_id"):
+            if candidate.get("telegram_id") and get_online_runner_for_sre(candidate.get("sre_id", "")):
                 sre_info = candidate
                 break
-        # 2) Fallback: any non-lead runner not excluded
+        # 2) Fallback: any non-lead runner not excluded, must be online
+        if not sre_info:
+            for rid, info in runners.items():
+                if rid in exclude or info.get("is_lead") or not info.get("telegram_id"):
+                    continue
+                if get_online_runner_for_sre(info.get("sre_id", "")):
+                    sre_info = {"id": rid, **info}
+                    break
+        # 3) Last resort: any non-lead with telegram_id (offline, but can still approve via Telegram)
+        if not sre_info:
+            for candidate in get_sres_for_service(service, exclude=exclude):
+                if candidate.get("telegram_id"):
+                    sre_info = candidate
+                    break
         if not sre_info:
             for rid, info in runners.items():
                 if rid in exclude or info.get("is_lead") or not info.get("telegram_id"):
@@ -1327,6 +1384,12 @@ async def job_complete(payload: _ClaudeDonePayload):
         return {"ok": False, "error": "job not found"}
 
     job["claude_summary"] = payload.summary
+
+    # Save Claude investigation result to AgentBase Memory
+    requester = job.get("requester_chat_id", "")
+    if requester:
+        session_id = payload.job_id
+        _add_to_history(requester, payload.summary, role="assistant")
 
     # Tìm SRE chat_id từ active conv
     sre_chat = next(
