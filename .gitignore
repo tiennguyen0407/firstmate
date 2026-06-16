@@ -1,6 +1,8 @@
 # Secrets & credentials
 .env
+.env.local
 runner/.env
+runner/.env.local
 .greennode.json
 .agentbase/
 deploy.config
