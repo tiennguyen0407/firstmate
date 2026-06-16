@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from manager.api.runner_api import router as runner_router
 from manager.api.telegram_webhook import router as telegram_router, error_log, DEBUG_MODE
+from manager.api.memory_api import router as memory_router
 
 # ── Logging ───────────────────────────────────────────────────────
 logging.basicConfig(
@@ -40,6 +41,7 @@ app.add_middleware(
 
 app.include_router(runner_router)
 app.include_router(telegram_router)
+app.include_router(memory_router)
 
 
 @app.get("/health")

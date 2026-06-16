@@ -99,9 +99,29 @@ def build_graph() -> StateGraph:
     builder.add_edge("report_result", END)
     builder.add_edge("escalated",     END)
 
-    memory_id = os.environ["AGENTBASE_MEMORY_ID"]
-    logger.info(f"[Memory] Initializing AgentBaseMemoryEvents with memory_id={memory_id}")
-    checkpointer = LoggedCheckpointer(memory_id=memory_id)
+    # In DEBUG mode, graph is imported but never invoked — use MemorySaver (in-RAM)
+    # to avoid requiring AgentBase Memory credentials at startup.
+    # In NORMAL mode, use AgentBaseMemoryEvents for persistent checkpoints.
+    debug_mode = os.getenv("DEBUG", "false").lower() == "true"
+    memory_id = os.getenv("AGENTBASE_MEMORY_ID", "")
+
+    if not debug_mode and memory_id:
+        mem_client_id = os.getenv("MEMORY_CLIENT_ID") or os.getenv("GREENNODE_CLIENT_ID")
+        mem_client_secret = os.getenv("MEMORY_CLIENT_SECRET") or os.getenv("GREENNODE_CLIENT_SECRET")
+        mem_client = None
+        if mem_client_id and mem_client_secret:
+            from greennode_agentbase.memory import MemoryClient
+            from greennode_agentbase.identity import IAMCredentials
+            mem_client = MemoryClient(iam_credentials=IAMCredentials(
+                client_id=mem_client_id, client_secret=mem_client_secret,
+            ))
+            logger.info(f"[Memory] Using MEMORY_CLIENT_ID={mem_client_id[:8]}...")
+        logger.info(f"[Memory] Initializing AgentBaseMemoryEvents with memory_id={memory_id}")
+        checkpointer = LoggedCheckpointer(memory_id=memory_id, memory_client=mem_client)
+    else:
+        from langgraph.checkpoint.memory import MemorySaver
+        logger.info(f"[Memory] DEBUG mode or no MEMORY_ID — using in-memory checkpointer")
+        checkpointer = MemorySaver()
 
     return builder.compile(
         checkpointer=checkpointer,
@@ -112,8 +132,8 @@ def build_graph() -> StateGraph:
 class LoggedCheckpointer(AgentBaseMemoryEvents):
     """AgentBaseMemoryEvents with logging on put/get calls."""
 
-    def __init__(self, memory_id: str):
-        super().__init__(memory_id=memory_id)
+    def __init__(self, memory_id: str, memory_client=None):
+        super().__init__(memory_id=memory_id, memory_client=memory_client)
 
     def put(self, config, checkpoint, metadata, new_versions):
         thread_id = config.get("configurable", {}).get("thread_id", "?")
