@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# ChatOpenAI is used as an OpenAI-compatible client pointing to GreenNode MaaS endpoint
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 
