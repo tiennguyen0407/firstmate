@@ -23,39 +23,25 @@ router = APIRouter(prefix="/webhook", tags=["telegram"])
 # ── Config ────────────────────────────────────────────────────────
 DEBUG_MODE = os.getenv("DEBUG", "false").lower() == "true"
 
-# ── AgentBase Memory client (DEBUG mode) ─────────────────────────
-_MEMORY_ID = os.getenv("AGENTBASE_MEMORY_ID", "")
-_memory_client = None
+# ── AgentBase Memory service ──────────────────────────────────────
 
-def _get_memory_client():
-    global _memory_client
-    if _memory_client is None and _MEMORY_ID:
-        try:
-            from greennode_agentbase.memory import MemoryClient
-            _memory_client = MemoryClient()
-            logger.info(f"[Memory] MemoryClient initialized, memory_id={_MEMORY_ID}")
-        except Exception as exc:
-            logger.warning(f"[Memory] Failed to init MemoryClient: {exc}")
-    return _memory_client
-
-async def _save_event(actor_id: str, session_id: str, role: str, content: str):
-    """Save a conversation event to AgentBase Memory (best-effort, non-blocking)."""
-    if not _MEMORY_ID:
-        return
+async def _save_memory(actor_id: str, content: str, role: str = "user",
+                       session_id: str = ""):
+    """Save conversation event to AgentBase Memory (best-effort, non-blocking)."""
     try:
-        client = _get_memory_client()
-        if not client:
+        from manager.services.memory_save import get_memory_service
+        svc = get_memory_service()
+        if not svc:
             return
-        from greennode_agentbase.memory.models import EventCreateRequest, EventPayload
-        request = EventCreateRequest(
-            payload=EventPayload(type="conversational", role=role, message=content)
+        result = await svc.save(
+            actor_id=actor_id,
+            content=content,
+            source="conversation",
+            metadata={"role": role, "session_id": session_id},
         )
-        await client.create_event_async(
-            id=_MEMORY_ID, actorId=actor_id, sessionId=session_id, request=request
-        )
-        logger.info(f"[Memory] Saved event actor={actor_id} session={session_id[:8]} role={role} len={len(content)}")
+        logger.info(f"[Memory] {result.get('status')} actor={actor_id} role={role} len={len(content)}")
     except Exception as exc:
-        logger.error(f"[Memory] Failed to save event: {exc}")
+        logger.error(f"[Memory] save failed: {exc}")
 
 # ── Error log ────────────────────────────────────────────────────
 error_log: deque = deque(maxlen=100)
@@ -77,10 +63,12 @@ def _add_to_history(chat_id: str, content: str, role: str = "user") -> None:
     if chat_id not in _chat_history:
         _chat_history[chat_id] = deque(maxlen=_MAX_HISTORY)
     _chat_history[chat_id].append(content)
-    # Save to AgentBase Memory (non-blocking)
+    # Save event to AgentBase Memory (non-blocking)
     conv = _active_conv.get(chat_id, {})
     session_id = conv.get("job_id", f"chat-{chat_id}")
-    asyncio.ensure_future(_save_event(actor_id=chat_id, session_id=session_id, role=role, content=content))
+    asyncio.ensure_future(_save_memory(
+        actor_id=chat_id, content=content, role=role, session_id=session_id,
+    ))
 
 
 _bot: Bot | None = None
@@ -449,12 +437,14 @@ async def _handle_conversation_reply(chat_id: str, text: str, name: str):
         if intent == "complete":
             # Thông báo Dev/QC
             if requester:
+                complete_msg = f"✅ SRE {name} báo hoàn thành\n\n{summary}"
                 await bot.send_message(
                     requester,
                     f"✅ *SRE {name} báo hoàn thành*\n\n{summary}\n\n"
                     f"_Có yêu cầu tiếp theo? Nhắn thẳng vào đây hoặc dùng /follow <action>._",
                     parse_mode="Markdown",
                 )
+                _add_to_history(requester, complete_msg, role="assistant")
             await bot.send_message(chat_id, "✅ Task hoàn thành. Conv đã đóng.")
             # Đánh dấu dev/qc conv completed (giữ để hỏi lại nếu follow-up thiếu context)
             if requester and requester in _active_conv:
@@ -529,21 +519,25 @@ async def _handle_conversation_reply(chat_id: str, text: str, name: str):
         elif intent == "question":
             # SRE hỏi Dev/QC → forward
             if requester:
+                question_msg = f"❓ SRE {name} hỏi:\n\n{text}"
                 await bot.send_message(
                     requester,
                     f"❓ *SRE {name} hỏi*:\n\n{text}\n\n_Trả lời thẳng vào đây để SRE nhận được._",
                     parse_mode="Markdown",
                 )
+                _add_to_history(requester, question_msg, role="assistant")
             await bot.send_message(chat_id, "📨 Đã gửi câu hỏi tới requester. Chờ phản hồi...")
 
         else:
             # update / other → forward cho Dev/QC như status update
             if requester:
+                update_msg = f"📊 SRE {name} cập nhật:\n\n{summary}"
                 await bot.send_message(
                     requester,
                     f"📊 *SRE {name} cập nhật*:\n\n{summary}",
                     parse_mode="Markdown",
                 )
+                _add_to_history(requester, update_msg, role="assistant")
             await bot.send_message(chat_id, "📨 Đã gửi cập nhật cho requester.")
 
 
@@ -551,9 +545,23 @@ async def _handle_conversation_reply(chat_id: str, text: str, name: str):
 # CALLBACK HANDLER — xử lý button clicks (dbg/sre/lead)
 # ══════════════════════════════════════════════════════════════════
 
+async def _safe_edit(query: CallbackQuery, text: str = None, reply_markup=None):
+    """Edit callback message, ignoring expired query errors."""
+    try:
+        if text is not None:
+            await query.edit_message_text(text)
+        if reply_markup is not None:
+            await query.edit_message_reply_markup(reply_markup=reply_markup)
+    except Exception:
+        pass  # query expired or message unchanged
+
+
 async def _handle_callback(query: CallbackQuery):
     try:
-        await query.answer()
+        try:
+            await query.answer()
+        except Exception:
+            pass  # query already expired, continue processing
         parts = query.data.split(":")
         if len(parts) != 3:
             return
@@ -571,10 +579,7 @@ async def _handle_callback(query: CallbackQuery):
             name = conv.get("requester_name", "?")
             del _active_conv[user_chat_id]
             label = "🌐 Gateway log" if task_kind == "gateway_log" else "☸️ Kubernetes"
-            await query.edit_message_text(
-                f"Yêu cầu: _{original_text}_\nLoại: *{label}*",
-                parse_mode="Markdown",
-            )
+            await _safe_edit(query, text=f"Yêu cầu: {original_text}\nLoại: {label}")
             await _maybe_clarify_action(user_chat_id, original_text, name, task_kind=task_kind)
             return
 
@@ -595,7 +600,7 @@ async def _handle_callback(query: CallbackQuery):
         if kind == "dbg":
             job_meta = _debug_jobs.get(job_id)
             if not job_meta:
-                await query.edit_message_text("⚠️ Job không tìm thấy (server đã restart).")
+                await _safe_edit(query, text="⚠️ Job không tìm thấy (server đã restart).")
                 return
 
             requester = job_meta["requester_chat_id"]
@@ -644,17 +649,17 @@ async def _handle_callback(query: CallbackQuery):
                     f"_Bạn có thể nhắn thêm thông tin bất cứ lúc nào._",
                     parse_mode="Markdown",
                 )
-                await query.edit_message_text(
+                await _safe_edit(query, text=(
                     f"✅ Đã nhận task\n"
                     f"Service: {job_meta['service']}\n\n"
                     f"Runner đang mở terminal Claude Code...\n"
                     f"Nhắn tin vào đây để cập nhật trạng thái (xong/cần lead/chuyển task)."
-                )
+                ))
 
             elif action in ("busy", "declined"):
                 label = "đang bận" if action == "busy" else "từ chối task"
                 icon = "🔄" if action == "busy" else "❌"
-                await query.edit_message_text(f"{icon} Đã báo {label}.")
+                await _safe_edit(query, text=f"{icon} Đã báo {label}.")
                 await get_bot().send_message(
                     requester,
                     f"{icon} *{sre_name}* {label}. Đang tìm SRE khác...",
@@ -676,7 +681,7 @@ async def _handle_callback(query: CallbackQuery):
         elif kind == "verify":
             job_meta = _debug_jobs.get(job_id)
             if not job_meta:
-                await query.edit_message_text("⚠️ Job không tìm thấy.")
+                await _safe_edit(query, text="⚠️ Job không tìm thấy.")
                 return
 
             requester = job_meta.get("requester_chat_id")
@@ -703,7 +708,7 @@ async def _handle_callback(query: CallbackQuery):
                     if requester in _active_conv:
                         _active_conv[requester]["status"] = "completed"
                 try:
-                    await query.edit_message_reply_markup(reply_markup=None)
+                    await _safe_edit(query, reply_markup=None)
                 except Exception:
                     pass
                 await get_bot().send_message(sre_chat_id, "✅ Đã gửi kết quả. Task hoàn thành.")
@@ -721,7 +726,7 @@ async def _handle_callback(query: CallbackQuery):
                     )
                 # Xóa buttons nhưng giữ nguyên nội dung summary
                 try:
-                    await query.edit_message_reply_markup(reply_markup=None)
+                    await _safe_edit(query, reply_markup=None)
                 except Exception:
                     pass
                 await get_bot().send_message(
@@ -741,20 +746,20 @@ async def _handle_callback(query: CallbackQuery):
                 interrupt_data = state.tasks[0].interrupts[0].value if state.tasks else {}
                 requester = result.get("requester_telegram_id", "")
                 await _handle_langgraph_interrupt(job_id, next_node, interrupt_data, requester)
-                await query.edit_message_text(f"✅ Đã nhận: {action}")
+                await _safe_edit(query, text=f"✅ Đã nhận: {action}")
             else:
                 final = result.get("final_report") or "✅ Xử lý xong."
                 requester_id = result.get("requester_telegram_id", "")
                 if requester_id:
                     await get_bot().send_message(requester_id, final, parse_mode="Markdown")
-                await query.edit_message_text(f"✅ Hoàn thành — {action}")
+                await _safe_edit(query, text=f"✅ Hoàn thành — {action}")
 
     except Exception as exc:
         tb = traceback.format_exc()
         error_log.append({"error": str(exc), "traceback": tb})
         logger.error(f"callback error: {exc}\n{tb}")
         try:
-            await query.edit_message_text(f"❌ Lỗi: {type(exc).__name__}: {str(exc)[:200]}")
+            await _safe_edit(query, text=f"❌ Lỗi: {type(exc).__name__}: {str(exc)[:200]}")
         except Exception:
             pass
 
@@ -1022,6 +1027,7 @@ async def _classify_and_respond(chat_id: str, text: str, requester_name: str):
             if not answer:
                 raise ValueError("LLM returned no answer for knowledge question")
             await _send_long_message(chat_id, _md_to_html(answer))
+            _add_to_history(chat_id, answer, role="assistant")
         except Exception as exc:
             err = f"{type(exc).__name__}: {str(exc)[:300]}"
             error_log.append({"error": err, "source": "answer_knowledge"})
