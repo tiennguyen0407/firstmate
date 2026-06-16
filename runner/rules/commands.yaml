@@ -17,6 +17,8 @@ allow:
   - "kubectl config get-contexts"
   - "kubectl config current-context"
   - "kubectl diff"
+  - "kubectl rollout status"
+  - "kubectl rollout history"
 
   # Filesystem read
   - "cat"
