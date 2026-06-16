@@ -309,7 +309,7 @@ async def _start_new_task(chat_id: str, text: str, requester_name: str, task_kin
             "assignment_attempts": [], "needs_lead_approval": False,
             "status": JobStatus.PENDING,
         }
-        thread_config = {"configurable": {"thread_id": job_id}}
+        thread_config = {"configurable": {"thread_id": job_id, "actor_id": chat_id}}
         asyncio.create_task(_run_graph(job_id, initial_state, thread_config, chat_id))
         await get_bot().send_message(chat_id, "🔍 Đang kiểm tra...")
 
@@ -691,7 +691,8 @@ async def _handle_callback(query: CallbackQuery):
 
         # ── Normal LangGraph mode ─────────────────────────────────
         elif kind in ("sre", "lead"):
-            thread_config = {"configurable": {"thread_id": job_id}}
+            requester_id = (_debug_jobs.get(job_id) or {}).get("requester_chat_id", "unknown")
+            thread_config = {"configurable": {"thread_id": job_id, "actor_id": requester_id}}
             result = await graph.ainvoke(Command(resume=action), thread_config)
             state = graph.get_state(thread_config)
             if state.next:
@@ -1183,13 +1184,28 @@ async def _debug_forward_to_sre(
         runners = cfg.get("runners", {})
         exclude = exclude or []
 
+        from manager.services.runner_registry import get_online_runner_for_sre
+
         sre_info: dict | None = None
-        # 1) Service-aware: owner first, then SREs with services_owned
+        # 1) Service-aware + online: owner first, then SREs with services_owned
         for candidate in get_sres_for_service(service, exclude=exclude):
-            if candidate.get("telegram_id"):
+            if candidate.get("telegram_id") and get_online_runner_for_sre(candidate.get("sre_id", "")):
                 sre_info = candidate
                 break
-        # 2) Fallback: any non-lead runner not excluded
+        # 2) Fallback: any non-lead runner not excluded, must be online
+        if not sre_info:
+            for rid, info in runners.items():
+                if rid in exclude or info.get("is_lead") or not info.get("telegram_id"):
+                    continue
+                if get_online_runner_for_sre(info.get("sre_id", "")):
+                    sre_info = {"id": rid, **info}
+                    break
+        # 3) Last resort: any non-lead with telegram_id (offline, but can still approve via Telegram)
+        if not sre_info:
+            for candidate in get_sres_for_service(service, exclude=exclude):
+                if candidate.get("telegram_id"):
+                    sre_info = candidate
+                    break
         if not sre_info:
             for rid, info in runners.items():
                 if rid in exclude or info.get("is_lead") or not info.get("telegram_id"):
