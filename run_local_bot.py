@@ -14,7 +14,7 @@ Usage:
 
     # Chỉ cần khi --full:
     RUNNER_ID=sre-local
-    SRE_ID=tiennt14@vng.com.vn
+    SRE_ID=yourname@company.com
     SRE_TELEGRAM_ID=<your-telegram-id>
 """
 

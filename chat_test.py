@@ -4,7 +4,7 @@ Local test REPL cho FirstMate — không cần Telegram, không cần deploy.
 
 Usage:
     python chat_test.py
-    python chat_test.py --chat-id 743616350 --name "Tien"
+    python chat_test.py --chat-id <your-telegram-id> --name "Your Name"
 """
 
 from __future__ import annotations

@@ -221,7 +221,7 @@ async def _run_consolidation(chat_id: str) -> Optional[dict]:
         base_url="https://maas-llm-aiplatform-hcm.api.vngcloud.vn/v1",
         api_key=os.environ["GREENNODE_API_KEY"],
         temperature=0,
-        max_tokens=4096,
+        max_tokens=8192,
         timeout=120,
         max_retries=0,
     )
@@ -232,13 +232,33 @@ async def _run_consolidation(chat_id: str) -> Optional[dict]:
     ])
 
     raw = response.content.strip()
+    think_len = len(re.findall(r"<think>.*?</think>", raw, flags=re.DOTALL))
     raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
+    raw = raw.strip()
+    logger.info(f"[Consolidator] LLM response: think_blocks={think_len} json_len={len(raw)} preview={raw[:100]!r}")
 
-    facts = json.loads(raw.strip())
+    try:
+        facts = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning(f"[Consolidator] JSON parse failed (len={len(raw)}), attempting repair")
+        # Try truncating at the last closing brace to recover partial JSON
+        repaired = None
+        last_brace = raw.rfind("}")
+        while last_brace > 0:
+            try:
+                repaired = json.loads(raw[:last_brace + 1])
+                break
+            except json.JSONDecodeError:
+                last_brace = raw.rfind("}", 0, last_brace)
+        if repaired is None:
+            logger.error("[Consolidator] JSON repair failed, skipping")
+            return None
+        facts = repaired
+        logger.info("[Consolidator] JSON repaired successfully")
 
     # Merge service map
     new_services = facts.get("service_namespace_map", {})
